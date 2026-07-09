@@ -1,34 +1,9 @@
 [build]
-  command = "flutter build web --release --pwa-strategy=offline-first"
+  command = """
+    git clone https://github.com/flutter/flutter.git --depth 1 -b stable /opt/buildhome/flutter &&
+    export PATH="$PATH:/opt/buildhome/flutter/bin" &&
+    flutter config --no-analytics &&
+    flutter pub get &&
+    flutter build web --release --pwa-strategy=offline-first
+  """
   publish = "build/web"
-
-[[redirects]]
-  from = "/*"
-  to = "/index.html"
-  status = 200
-
-[[headers]]
-  for = "/manifest.json"
-  [headers.values]
-    Content-Type = "application/manifest+json"
-    Cache-Control = "public, max-age=3600"
-
-[[headers]]
-  for = "/flutter_service_worker.js"
-  [headers.values]
-    Cache-Control = "no-cache"
-
-[[headers]]
-  for = "/main.dart.js"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/assets/*"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/icons/*"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
