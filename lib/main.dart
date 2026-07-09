@@ -2,13 +2,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 void main() => runApp(const CoachSplitApp());
@@ -1518,7 +1517,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return rows;
   }
 
-  Future<File> _createResultsPngFile() async {
+  Future<Uint8List> _createResultsPngBytes() async {
     final event = _event;
     if (event == null) throw StateError('Kein Bewerb geladen');
     final rows = _resultTableRowsForExport();
@@ -1682,17 +1681,31 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final image = await picture.toImage((width * scale).round(), (height * scale).round());
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
     if (bytes == null) throw StateError('PNG konnte nicht erstellt werden');
-    final dir = await getTemporaryDirectory();
-    final safeName = event.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '_');
-    final file = File('${dir.path}/coachsplit_${safeName}_${DateTime.now().millisecondsSinceEpoch}.png');
-    await file.writeAsBytes(bytes.buffer.asUint8List());
-    return file;
+    return bytes.buffer.asUint8List();
+  }
+
+  String _safeExportFileName() {
+    final eventName = (_event?.name ?? 'ergebnis').trim().isEmpty ? 'ergebnis' : _event!.name.trim();
+    final safeName = eventName.replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '_');
+    return 'coachsplit_${safeName}_${DateTime.now().millisecondsSinceEpoch}.png';
   }
 
   Future<void> _exportPngImage() async {
     try {
-      final file = await _createResultsPngFile();
-      await Share.shareXFiles([XFile(file.path)], text: 'CoachSplit Ergebnis: ${_event?.name ?? ''}');
+      final pngBytes = await _createResultsPngBytes();
+      final fileName = _safeExportFileName();
+      final xFile = XFile.fromData(
+        pngBytes,
+        mimeType: 'image/png',
+        name: fileName,
+        lastModified: DateTime.now(),
+      );
+
+      await Share.shareXFiles(
+        [xFile],
+        text: 'CoachSplit Ergebnis: ${_event?.name ?? ''}',
+        subject: 'CoachSplit Ergebnis',
+      );
       _show('Bildexport erstellt');
     } catch (e) {
       _show(e.toString().replaceFirst('Bad state: ', ''));
