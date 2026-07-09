@@ -23,6 +23,12 @@ class CoachSplitApp extends StatelessWidget {
     return '$h:$m:$s';
   }
 
+  String _formatTimeOfDay(TimeOfDay time) {
+    final h = time.hour.toString().padLeft(2, '0');
+    final m = time.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -1748,9 +1754,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return '$h:$m:$s';
   }
 
+  String _formatTimeOfDay(TimeOfDay time) {
+    final h = time.hour.toString().padLeft(2, '0');
+    final m = time.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
   @override
   Widget build(BuildContext context) {
     final event = _event;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth >= 900) {
+          return _desktopShell(event);
+        }
+        return _mobileShell(event);
+      },
+    );
+  }
+
+  Widget _mobileShell(RaceEvent? event) {
     return Scaffold(
       appBar: AppBar(title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Text('CoachSplit 1.03'),
@@ -1759,15 +1782,242 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       body: SafeArea(
         child: Column(children: [
           _Stats(event: event),
-          _Nav(selected: _page, onChanged: (i) {
-            if (i > 0 && !_setupReady) {
-              _show('Bitte zuerst im Setup auf "Zum Start" tippen.');
-              return;
-            }
-            setState(() => _page = i);
-          }),
+          _Nav(selected: _page, onChanged: _changePage),
           Expanded(child: IndexedStack(index: _page, children: [_setupPage(), _startPage(), _capturePage(), _resultsPage()])),
         ]),
+      ),
+    );
+  }
+
+  void _changePage(int i) {
+    if (i > 0 && !_setupReady) {
+      _show('Bitte zuerst im Setup auf "Zum Start" tippen.');
+      return;
+    }
+    setState(() => _page = i);
+  }
+
+  Widget _desktopShell(RaceEvent? event) {
+    return Scaffold(
+      body: SafeArea(
+        child: Row(
+          children: [
+            _desktopSidebar(event),
+            Expanded(
+              child: Column(
+                children: [
+                  _desktopHeader(event),
+                  Expanded(
+                    child: IndexedStack(
+                      index: _page,
+                      children: [
+                        _desktopFramed(_setupPage(), maxWidth: 1180),
+                        _desktopOverviewPage(event),
+                        _desktopFramed(_capturePage(), maxWidth: 1180),
+                        _desktopFramed(_resultsPage(), maxWidth: 1260),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _desktopFramed(Widget child, {double maxWidth = 1180}) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: maxWidth),
+        child: child,
+      ),
+    );
+  }
+
+  Widget _desktopHeader(RaceEvent? event) {
+    return Container(
+      height: 64,
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Color(0xFF1C2D3B))),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(event?.name ?? 'Kein Bewerb', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 2),
+                Row(children: [
+                  Container(width: 8, height: 8, decoration: const BoxDecoration(color: Color(0xFF3EE06A), shape: BoxShape.circle)),
+                  const SizedBox(width: 6),
+                  Text(event == null ? 'Setup erforderlich' : 'Live · ${event.intervalSeconds}s · ${event.compareByCategory ? 'Altersklassen' : 'Gesamtwertung'}', style: const TextStyle(color: Color(0xFF9FB3C5))),
+                ]),
+              ],
+            ),
+          ),
+          Text(_formatClock(DateTime.now()), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900, letterSpacing: 1.0)),
+        ],
+      ),
+    );
+  }
+
+  Widget _desktopSidebar(RaceEvent? event) {
+    final items = const [
+      (Icons.settings, 'Vorbereitung'),
+      (Icons.dashboard, 'Übersicht'),
+      (Icons.flag, 'Erfassung'),
+      (Icons.emoji_events, 'Ergebnisse'),
+    ];
+    return Container(
+      width: 248,
+      decoration: const BoxDecoration(
+        color: Color(0xFF07111B),
+        border: Border(right: BorderSide(color: Color(0xFF1C2D3B))),
+      ),
+      child: Column(
+        children: [
+          const SizedBox(height: 28),
+          const CoachSplitLogo(size: 86, showText: true, vertical: true),
+          const SizedBox(height: 28),
+          for (var i = 0; i < items.length; i++)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+              child: _DesktopNavButton(
+                icon: items[i].$1,
+                label: items[i].$2,
+                selected: _page == i,
+                onTap: () => _changePage(i),
+              ),
+            ),
+          const Spacer(),
+          Container(
+            margin: const EdgeInsets.all(14),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0E1B27),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFF1D3447)),
+            ),
+            child: Row(children: [
+              const CoachSplitLogo(size: 42),
+              const SizedBox(width: 10),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(event?.name ?? 'Kein Bewerb', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
+                Text(event == null ? 'Setup' : 'Aktives Event', style: const TextStyle(fontSize: 12, color: Color(0xFF9FB3C5))),
+              ])),
+            ]),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _desktopOverviewPage(RaceEvent? event) {
+    if (event == null) return const Center(child: Text('Kein Bewerb geladen'));
+    final waiting = event.athletes.where((a) => a.status == AthleteStatus.waiting).toList();
+    final running = event.athletes.where((a) => a.status == AthleteStatus.running).toList();
+    final next = waiting.isEmpty ? null : waiting.first;
+    final finishPoints = event.points.where((p) => p.type == PointType.finish).toList();
+    final rankingPoint = finishPoints.isNotEmpty ? finishPoints.last : event.points.last;
+    final rows = _ranking(rankingPoint).take(7).toList();
+
+    Athlete? lastAthlete;
+    SplitPoint? lastPoint;
+    DateTime? lastTime;
+    for (final athlete in event.athletes) {
+      for (final point in event.points) {
+        final t = _captureTime(athlete, point);
+        if (t != null && (lastTime == null || t.isAfter(lastTime!))) {
+          lastAthlete = athlete;
+          lastPoint = point;
+          lastTime = t;
+        }
+      }
+    }
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 1280),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: 7,
+                child: ListView(
+                  children: [
+                    Row(children: [
+                      Expanded(child: _DesktopInfoCard(
+                        title: 'Nächster Start',
+                        child: next == null
+                            ? const Text('Keine offenen Starts', style: TextStyle(color: Color(0xFF9FB3C5)))
+                            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                const Text('Startnummer', style: TextStyle(color: Color(0xFF9FB3C5))),
+                                Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                                  Text('${next.bib}', style: const TextStyle(fontSize: 56, height: 1, fontWeight: FontWeight.w900)),
+                                  const SizedBox(width: 18),
+                                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Text(next.name, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+                                    Text(next.category, style: const TextStyle(color: Color(0xFF9FB3C5))),
+                                  ])),
+                                ]),
+                                const SizedBox(height: 14),
+                                const Text('Start in', style: TextStyle(color: Color(0xFF9FB3C5))),
+                                Text(_eta(next.scheduledStart), style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w900, color: Color(0xFF2F8CFF))),
+                              ]),
+                      )),
+                      const SizedBox(width: 16),
+                      Expanded(child: _DesktopInfoCard(
+                        title: 'Letzte Erfassung',
+                        child: lastAthlete == null
+                            ? const Text('Noch keine Erfassung', style: TextStyle(color: Color(0xFF9FB3C5)))
+                            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                Text(lastPoint?.name ?? 'Messpunkt', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                                Text('Startnr. ${lastAthlete!.bib}', style: const TextStyle(color: Color(0xFF9FB3C5))),
+                                const SizedBox(height: 8),
+                                Text(lastAthlete.name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w900)),
+                                const SizedBox(height: 12),
+                                Text(_formatClock(lastTime!), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900)),
+                              ]),
+                      )),
+                    ]),
+                    const SizedBox(height: 16),
+                    _DesktopInfoCard(
+                      title: 'Ergebnisse – ${rankingPoint.name}',
+                      child: rows.isEmpty
+                          ? const Padding(padding: EdgeInsets.all(24), child: Text('Noch keine Zeiten erfasst.', style: TextStyle(color: Color(0xFF9FB3C5))))
+                          : _DesktopResultsTable(rows: rows, fmt: _fmtDuration),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              SizedBox(
+                width: 260,
+                child: _DesktopInfoCard(
+                  title: 'Erfassung',
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    _BigActionButton(label: 'Start erfassen', icon: Icons.play_arrow, color: const Color(0xFF0D84FF), onTap: () => _changePage(1)),
+                    const SizedBox(height: 14),
+                    _BigActionButton(label: 'Zwischenzeit erfassen', icon: Icons.flag, color: const Color(0xFF30A852), onTap: () => _changePage(2)),
+                    const SizedBox(height: 14),
+                    _BigActionButton(label: 'Ziel erfassen', icon: Icons.sports_score, color: const Color(0xFFD63D45), onTap: () => _changePage(2)),
+                    const SizedBox(height: 14),
+                    OutlinedButton.icon(onPressed: () => _changePage(3), icon: const Icon(Icons.image), label: const Text('Export öffnen')),
+                    const SizedBox(height: 18),
+                    Text('${waiting.length} warten · ${running.length} unterwegs', style: const TextStyle(color: Color(0xFF9FB3C5))),
+                  ]),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1823,7 +2073,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
             Expanded(child: OutlinedButton.icon(onPressed: () async {
               final picked = await showTimePicker(context: context, initialTime: _firstStartTime);
               if (picked != null) { setState(() => _firstStartTime = picked); _scheduleSetupAutosave(); }
-            }, icon: const Icon(Icons.schedule), label: Text('Start: ${_firstStartTime.format(context)}'))),
+            }, icon: const Icon(Icons.schedule), label: Text('Start: ${_formatTimeOfDay(_firstStartTime)}'))),
             const SizedBox(width: 8),
             DropdownButton<int>(value: _intervalSeconds, items: const [DropdownMenuItem(value: 15, child: Text('15s')), DropdownMenuItem(value: 30, child: Text('30s')), DropdownMenuItem(value: 60, child: Text('60s'))], onChanged: (v) {
               if (v != null) { setState(() => _intervalSeconds = v); _scheduleSetupAutosave(); }
@@ -1989,15 +2239,141 @@ class _Stat extends StatelessWidget {
 }
 
 
-class CoachSplitLogo extends StatelessWidget {
-  const CoachSplitLogo({super.key, this.size = 34, this.showText = false});
 
-  final double size;
-  final bool showText;
+class _DesktopNavButton extends StatelessWidget {
+  const _DesktopNavButton({required this.icon, required this.label, required this.selected, required this.onTap});
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final mark = Container(
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: Container(
+        height: 52,
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF123A63) : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: selected ? const Color(0xFF1D7ED4) : Colors.transparent),
+        ),
+        child: Row(children: [
+          Icon(icon, color: selected ? const Color(0xFF2F9BFF) : const Color(0xFFB9C6D2)),
+          const SizedBox(width: 12),
+          Text(label, style: TextStyle(fontWeight: selected ? FontWeight.w800 : FontWeight.w600, color: selected ? Colors.white : const Color(0xFFD7E0E8))),
+        ]),
+      ),
+    );
+  }
+}
+
+class _DesktopInfoCard extends StatelessWidget {
+  const _DesktopInfoCard({required this.title, required this.child});
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0D1721),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFF1F3446)),
+        boxShadow: const [BoxShadow(color: Color(0x55000000), blurRadius: 18, offset: Offset(0, 10))],
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 18),
+        child,
+      ]),
+    );
+  }
+}
+
+class _BigActionButton extends StatelessWidget {
+  const _BigActionButton({required this.label, required this.icon, required this.color, required this.onTap});
+  final String label;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: Container(
+        height: 88,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(colors: [color.withOpacity(0.95), color.withOpacity(0.72)]),
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [BoxShadow(color: color.withOpacity(0.20), blurRadius: 14, offset: const Offset(0, 8))],
+        ),
+        child: Row(children: [
+          Icon(icon, color: Colors.white, size: 30),
+          const SizedBox(width: 14),
+          Expanded(child: Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900))),
+        ]),
+      ),
+    );
+  }
+}
+
+class _DesktopResultsTable extends StatelessWidget {
+  const _DesktopResultsTable({required this.rows, required this.fmt});
+  final List<RankRow> rows;
+  final String Function(Duration) fmt;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Table(
+        columnWidths: const {
+          0: FixedColumnWidth(58),
+          1: FixedColumnWidth(86),
+          2: FlexColumnWidth(),
+          3: FixedColumnWidth(138),
+          4: FixedColumnWidth(138),
+        },
+        children: [
+          _row(['Platz', 'Startnr.', 'Name', 'Zeit', 'Rückstand'], header: true),
+          for (final row in rows)
+            _row(['${row.place}', '${row.athlete.bib}', row.athlete.name, fmt(row.elapsed), row.deltaToLeader == Duration.zero ? '—' : '+${fmt(row.deltaToLeader)}']),
+        ],
+      ),
+    );
+  }
+
+  TableRow _row(List<String> values, {bool header = false}) {
+    return TableRow(
+      decoration: BoxDecoration(color: header ? const Color(0xFF182635) : const Color(0xFF0F1B26)),
+      children: [
+        for (final value in values)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            child: Text(value, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontWeight: header ? FontWeight.w800 : FontWeight.w500, color: header ? const Color(0xFFD8E6F0) : Colors.white)),
+          ),
+      ],
+    );
+  }
+}
+
+class CoachSplitLogo extends StatelessWidget {
+  const CoachSplitLogo({super.key, this.size = 34, this.showText = false, this.vertical = false});
+
+  final double size;
+  final bool showText;
+  final bool vertical;
+
+  @override
+  Widget build(BuildContext context) {
+    final fallbackMark = Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
@@ -2011,38 +2387,40 @@ class CoachSplitLogo extends StatelessWidget {
           Icon(Icons.timer_outlined, color: const Color(0xFF2F8CFF), size: size * 0.62),
           Positioned(
             bottom: size * 0.15,
-            child: Text(
-              'CS',
-              style: TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w900,
-                fontSize: size * 0.28,
-                letterSpacing: -1,
-              ),
-            ),
+            child: Text('CS', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: size * 0.28, letterSpacing: -1)),
           ),
         ],
       ),
     );
 
+    final mark = ClipRRect(
+      borderRadius: BorderRadius.circular(size * 0.22),
+      child: Image.asset(
+        'assets/icon/coachsplit_icon.png',
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => fallbackMark,
+      ),
+    );
+
     if (!showText) return mark;
 
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        mark,
-        const SizedBox(width: 10),
-        RichText(
-          text: const TextSpan(
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: Colors.white),
-            children: [
-              TextSpan(text: 'Coach'),
-              TextSpan(text: 'Split', style: TextStyle(color: Color(0xFF2F8CFF))),
-            ],
-          ),
-        ),
-      ],
+    final text = RichText(
+      text: const TextSpan(
+        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: Colors.white),
+        children: [
+          TextSpan(text: 'Coach'),
+          TextSpan(text: 'Split', style: TextStyle(color: Color(0xFF2F8CFF))),
+        ],
+      ),
     );
+
+    if (vertical) {
+      return Column(mainAxisSize: MainAxisSize.min, children: [mark, const SizedBox(height: 10), text]);
+    }
+
+    return Row(mainAxisSize: MainAxisSize.min, children: [mark, const SizedBox(width: 10), text]);
   }
 }
 
