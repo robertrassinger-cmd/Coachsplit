@@ -1,5 +1,11 @@
 [build]
-  command = "flutter build web --release --pwa-strategy=offline-first"
+  command = """
+    git clone https://github.com/flutter/flutter.git --depth 1 -b stable /opt/buildhome/flutter &&
+    export PATH="$PATH:/opt/buildhome/flutter/bin" &&
+    flutter config --no-analytics &&
+    flutter pub get &&
+    flutter build web --release --pwa-strategy=offline-first
+  """
   publish = "build/web"
 
 [[redirects]]
