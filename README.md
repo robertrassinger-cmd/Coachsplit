@@ -69,17 +69,3 @@ Dann den kompletten Ordner `build/web` bei Netlify hochladen.
 ## Hinweis
 
 Eine PWA ersetzt auf iOS/Android nicht in allen Punkten eine native App. Für echte Wettkampfnutzung am Streckenrand bleibt die APK/native App weiterhin die robustere Variante.
-
-
-## Struktur ab dieser Version
-
-Die App wurde in mehrere Dart-Dateien aufgeteilt:
-
-```text
-lib/main.dart
-lib/src/coachsplit_app.dart
-lib/src/coachsplit_home.dart
-lib/src/models.dart
-```
-
-Die bestehende App-Logik bleibt erhalten; `main.dart` startet nur noch die App.
