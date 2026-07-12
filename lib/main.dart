@@ -2,13 +2,18 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
+import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+
+import 'web_download_stub.dart' if (dart.library.html) 'web_download_web.dart';
 
 void main() => runApp(const CoachSplitApp());
 
@@ -184,7 +189,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
   final _eventName = TextEditingController(text: 'Trainingsrennen Demo');
   final _athletesText = TextEditingController(text: _defaultAthletes);
-  final _pointsText = TextEditingController(text: 'Anstieg, split\nSchießstand, split\nZiel, ziel');
+  final _pointsText = TextEditingController(text: 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel');
   final _groupsText = TextEditingController(text: _defaultGroups);
 
   final Map<String, RaceEvent> _savedEvents = {};
@@ -292,10 +297,14 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     await prefs.setString(_archiveKey, jsonEncode(_archivedEvents.map((k, v) => MapEntry(k, v.toJson()))));
   }
 
-  DateTime _firstStartDateTime() {
-    final now = DateTime.now();
-    return DateTime(now.year, now.month, now.day, _firstStartTime.hour, _firstStartTime.minute);
+  DateTime _futureDateForTime(TimeOfDay time, {DateTime? reference}) {
+    final now = reference ?? DateTime.now();
+    var result = DateTime(now.year, now.month, now.day, time.hour, time.minute);
+    if (result.isBefore(now)) result = result.add(const Duration(days: 1));
+    return result;
   }
+
+  DateTime _firstStartDateTime() => _futureDateForTime(_firstStartTime);
 
   void _createEventFromSetup({bool silent = false}) {
     final firstStart = _firstStartDateTime();
@@ -364,62 +373,68 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     await _saveStorage();
   }
 
-  void _addSplitPointFromSetup() {
-    final points = _parsePoints(_pointsText.text);
-    final controller = TextEditingController(text: 'Messpunkt ${points.length + 1}');
-    var isFinish = false;
+  String _nextPointName(List<SplitPoint> points, String prefix) {
+    var highest = 0;
+    final pattern = RegExp('^${RegExp.escape(prefix)}\\s+(\\d+)\$');
+    for (final point in points) {
+      final match = pattern.firstMatch(point.name.trim());
+      final value = match == null ? null : int.tryParse(match.group(1) ?? '');
+      if (value != null && value > highest) highest = value;
+    }
+    return '$prefix ${highest + 1}';
+  }
 
-    showDialog(
+  String _suggestPointName(List<SplitPoint> points, String type) {
+    switch (type) {
+      case 'round': return _nextPointName(points, 'Runde');
+      case 'shootIn': return _nextPointName(points, 'Schießstand ein');
+      case 'shootOut': return _nextPointName(points, 'Schießstand aus');
+      default: return _nextPointName(points, 'Messpunkt');
+    }
+  }
+
+  Future<SplitPoint?> _pointFromTemplateDialog(List<SplitPoint> points) async {
+    var type = 'point';
+    final controller = TextEditingController(text: _suggestPointName(points, type));
+    return showDialog<SplitPoint>(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('Messpunkt hinzufügen'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: controller, decoration: const InputDecoration(labelText: 'Name')),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Zielpunkt'),
-                value: isFinish,
-                onChanged: (value) => setDialogState(() => isFinish = value),
-              ),
-            ],
-          ),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            DropdownButtonFormField<String>(
+              value: type,
+              decoration: const InputDecoration(labelText: 'Vorlage'),
+              items: const [
+                DropdownMenuItem(value: 'point', child: Text('Messpunkt')),
+                DropdownMenuItem(value: 'round', child: Text('Runde')),
+                DropdownMenuItem(value: 'shootIn', child: Text('Schießstand ein')),
+                DropdownMenuItem(value: 'shootOut', child: Text('Schießstand aus')),
+              ],
+              onChanged: (value) {
+                if (value == null) return;
+                setDialogState(() {
+                  type = value;
+                  controller.text = _suggestPointName(points, type);
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(labelText: 'Name', helperText: 'Der Vorschlag kann angepasst werden.'),
+            ),
+          ]),
           actions: [
             TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
             FilledButton(
-              onPressed: () async {
-                final name = controller.text.trim().isEmpty
-                    ? 'Messpunkt ${points.length + 1}'
-                    : controller.text.trim();
-
-                final newPoint = SplitPoint(
-                  id: 'p_${DateTime.now().millisecondsSinceEpoch}',
+              onPressed: () {
+                final name = controller.text.trim().isEmpty ? _suggestPointName(points, type) : controller.text.trim();
+                Navigator.pop(context, SplitPoint(
+                  id: 'p_${DateTime.now().microsecondsSinceEpoch}',
                   name: name,
-                  type: isFinish ? PointType.finish : PointType.split,
-                );
-
-                setState(() {
-                  final finishIndex = points.lastIndexWhere((p) => p.type == PointType.finish);
-                  if (!isFinish && finishIndex >= 0) {
-                    points.insert(finishIndex, newPoint);
-                  } else {
-                    points.add(newPoint);
-                  }
-
-                  _pointsText.text = points
-                      .map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}')
-                      .join('\n');
-
-                  if (_event != null && !_hasRaceData()) {
-                    _event!.points = points;
-                  }
-                });
-
-                Navigator.pop(context);
-                await _saveSetupFromFields();
-                _show('Messpunkt hinzugefügt');
+                  type: PointType.split,
+                ));
               },
               child: const Text('Hinzufügen'),
             ),
@@ -427,6 +442,25 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
         ),
       ),
     );
+  }
+
+  Future<void> _addSplitPointFromSetup() async {
+    final points = _parsePoints(_pointsText.text);
+    final newPoint = await _pointFromTemplateDialog(points);
+    if (newPoint == null) return;
+    final finishIndex = points.lastIndexWhere((p) => p.type == PointType.finish);
+    if (finishIndex >= 0) {
+      points.insert(finishIndex, newPoint);
+    } else {
+      points.add(newPoint);
+      points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
+    }
+    setState(() {
+      _pointsText.text = points.map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}').join('\n');
+      if (_event != null && !_hasRaceData()) _event!.points = points;
+    });
+    await _saveSetupFromFields();
+    _show('Messpunkt hinzugefügt');
   }
 
   Future<void> _archiveCurrentEvent() async {
@@ -513,7 +547,8 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       copy.athletes[i].scheduledStart = now.add(Duration(seconds: i * copy.intervalSeconds));
     }
 
-    copy.name = 'Neu aus Vorlage ${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}';
+    final templateStamp = '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}:${DateTime.now().second.toString().padLeft(2, '0')}';
+    copy.name = _uniqueEventName('Neu aus Vorlage $templateStamp');
     copy.firstStart = now;
 
     setState(() {
@@ -570,18 +605,21 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
   List<SplitPoint> _parsePoints(String text) {
     final lines = text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-    final result = <SplitPoint>[];
-
+    final splits = <SplitPoint>[];
     for (var i = 0; i < lines.length; i++) {
       final parts = lines[i].split(RegExp(r'[,;\t]')).map((e) => e.trim()).toList();
-      final name = parts.isNotEmpty && parts[0].isNotEmpty ? parts[0] : 'Messpunkt ${i + 1}';
+      final rawName = parts.isNotEmpty ? parts[0] : '';
       final typeRaw = parts.length > 1 ? parts[1].toLowerCase() : 'split';
-      final type = typeRaw.contains('ziel') || typeRaw.contains('finish') ? PointType.finish : PointType.split;
-      result.add(SplitPoint(id: 'p_$i', name: name, type: type));
+      final isFinish = typeRaw.contains('ziel') || typeRaw.contains('finish') || rawName.toLowerCase() == 'ziel';
+      if (!isFinish) {
+        splits.add(SplitPoint(
+          id: 'p_$i',
+          name: rawName.isEmpty ? 'Messpunkt ${splits.length + 1}' : rawName,
+          type: PointType.split,
+        ));
+      }
     }
-
-    if (result.isEmpty) result.add(SplitPoint(id: 'p_0', name: 'Ziel', type: PointType.finish));
-    return result;
+    return [...splits, SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish)];
   }
 
   Map<String, String> _parseGroups() {
@@ -624,18 +662,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     await _saveStorage();
   }
 
+  String _uniqueEventName(String base) {
+    if (!_savedEvents.containsKey(base)) return base;
+    var index = 2;
+    while (_savedEvents.containsKey('$base ($index)')) index++;
+    return '$base ($index)';
+  }
+
   void _newEvent() {
     _currentEventKey = null;
     _setupReady = false;
     _viewingArchivedEvent = false;
     final now = DateTime.now().add(const Duration(minutes: 2));
     setState(() {
-      _eventName.text = 'Neuer Bewerb ${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}';
+      final stamp = '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}:${DateTime.now().second.toString().padLeft(2, '0')}';
+      _eventName.text = _uniqueEventName('Neuer Bewerb $stamp');
       _intervalSeconds = 30;
       _compareByCategory = false;
       _autoStartEnabled = false;
       _athletesText.text = _defaultAthletes;
-      _pointsText.text = 'Anstieg, split\nZiel, ziel';
+      _pointsText.text = 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel';
       _event = RaceEvent(
         name: _eventName.text,
         firstStart: now,
@@ -649,10 +695,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     _saveEvent();
   }
 
-  DateTime _setupFirstStartDateTime() {
-    final now = DateTime.now();
-    return DateTime(now.year, now.month, now.day, _firstStartTime.hour, _firstStartTime.minute);
-  }
+  DateTime _setupFirstStartDateTime() => _futureDateForTime(_firstStartTime);
 
   Future<void> _prepareStartTimesInSetup() async {
     final firstStart = _setupFirstStartDateTime();
@@ -697,67 +740,23 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     setState(() => _page = 1);
   }
 
-  void _addSplitPointFromCapture() {
+  Future<void> _addSplitPointFromCapture() async {
     final event = _event;
     if (event == null) return;
-
-    final controller = TextEditingController(text: 'Messpunkt ${event.points.length + 1}');
-    var isFinish = false;
-
-    showDialog(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Messpunkt hinzufügen'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: controller, decoration: const InputDecoration(labelText: 'Name')),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Zielpunkt'),
-                value: isFinish,
-                onChanged: (value) => setDialogState(() => isFinish = value),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
-            FilledButton(
-              onPressed: () async {
-                final name = controller.text.trim().isEmpty
-                    ? 'Messpunkt ${event.points.length + 1}'
-                    : controller.text.trim();
-
-                final newPoint = SplitPoint(
-                  id: 'p_${DateTime.now().millisecondsSinceEpoch}',
-                  name: name,
-                  type: isFinish ? PointType.finish : PointType.split,
-                );
-
-                setState(() {
-                  final finishIndex = event.points.lastIndexWhere((p) => p.type == PointType.finish);
-                  if (!isFinish && finishIndex >= 0) {
-                    event.points.insert(finishIndex, newPoint);
-                  } else {
-                    event.points.add(newPoint);
-                  }
-
-                  _pointsText.text = event.points
-                      .map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}')
-                      .join('\n');
-                });
-
-                Navigator.pop(context);
-                await _saveEvent();
-                _show('Messpunkt hinzugefügt');
-              },
-              child: const Text('Hinzufügen'),
-            ),
-          ],
-        ),
-      ),
-    );
+    final newPoint = await _pointFromTemplateDialog(event.points);
+    if (newPoint == null) return;
+    setState(() {
+      final finishIndex = event.points.lastIndexWhere((p) => p.type == PointType.finish);
+      if (finishIndex >= 0) {
+        event.points.insert(finishIndex, newPoint);
+      } else {
+        event.points.add(newPoint);
+        event.points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
+      }
+      _pointsText.text = event.points.map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}').join('\n');
+    });
+    await _saveEvent();
+    _show('Messpunkt hinzugefügt');
   }
 
   Future<void> _deleteEvent(String name) async {
@@ -901,6 +900,23 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     _show('Fotoimport simuliert. V2: Kamera → OCR → Korrektur.');
   }
 
+  String _formatTimeOfDay24(TimeOfDay time) =>
+      '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+
+  void _toggleAutoStart() {
+    final enable = !_autoStartEnabled;
+    if (enable && _event != null) {
+      final now = DateTime.now();
+      for (final athlete in _event!.athletes.where((a) => a.status == AthleteStatus.waiting)) {
+        while (athlete.scheduledStart.isBefore(now)) {
+          athlete.scheduledStart = athlete.scheduledStart.add(const Duration(days: 1));
+        }
+      }
+      _saveEvent();
+    }
+    setState(() => _autoStartEnabled = enable);
+  }
+
   void _autoStart() {
     if (!_autoStartEnabled) return;
     final event = _event;
@@ -980,8 +996,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   DateTime _dateWithClock(String value, {required DateTime fallback}) {
     final parsed = _parseClock(value);
     if (parsed == null) return fallback;
-    final now = DateTime.now();
-    return DateTime(now.year, now.month, now.day, parsed.$1, parsed.$2, parsed.$3);
+    var result = DateTime(fallback.year, fallback.month, fallback.day, parsed.$1, parsed.$2, parsed.$3);
+    if (result.isBefore(DateTime.now())) result = result.add(const Duration(days: 1));
+    return result;
   }
 
   void _removeAthleteFromEvent(Athlete athlete) {
@@ -1532,6 +1549,11 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final chartHeight = 340.0;
     final height = headerHeight + tableHeight + chartHeight + 118.0;
 
+    final logoData = await rootBundle.load('assets/icon/coachsplit_icon.png');
+    final logoCodec = await ui.instantiateImageCodec(logoData.buffer.asUint8List(), targetWidth: 96, targetHeight: 96);
+    final logoFrame = await logoCodec.getNextFrame();
+    final logoImage = logoFrame.image;
+
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder)..scale(scale);
 
@@ -1559,9 +1581,10 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     final date = DateTime.now();
     final dateText = '${date.day.toString().padLeft(2, '0')}.${date.month.toString().padLeft(2, '0')}.${date.year}';
-    drawText('CoachSplit', 42, 26, 34, const Color(0xFF2F8CFF), w: FontWeight.w900, maxWidth: 300);
-    drawText('ZEIT. ANALYSIERT. VERBESSERT.', 42, 68, 13, const Color(0xFFC7D2DC), maxWidth: 300);
-    drawText(event.name, 330, 24, 32, Colors.white, w: FontWeight.w800, maxWidth: width - 560);
+    canvas.drawImageRect(logoImage, Rect.fromLTWH(0, 0, logoImage.width.toDouble(), logoImage.height.toDouble()), const Rect.fromLTWH(38, 18, 76, 76), Paint());
+    drawText('CoachSplit', 126, 25, 30, Colors.white, w: FontWeight.w900, maxWidth: 190);
+    drawText('ZEIT. ANALYSIERT. VERBESSERT.', 126, 63, 11, const Color(0xFFC7D2DC), maxWidth: 210);
+    drawText(event.name, 350, 24, 32, Colors.white, w: FontWeight.w800, maxWidth: width - 580);
     drawText('Ergebnisliste', 330, 66, 22, const Color(0xFF2F8CFF), maxWidth: 280);
     drawText(dateText, width - 190, 42, 18, const Color(0xFFD8E0E8), maxWidth: 150);
 
@@ -1679,34 +1702,95 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     final picture = recorder.endRecording();
     final image = await picture.toImage((width * scale).round(), (height * scale).round());
-    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
-    if (bytes == null) throw StateError('PNG konnte nicht erstellt werden');
-    return bytes.buffer.asUint8List();
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    if (byteData == null) throw StateError('PNG konnte nicht erstellt werden');
+    return byteData.buffer.asUint8List();
   }
 
-  String _safeExportFileName() {
-    final eventName = (_event?.name ?? 'ergebnis').trim().isEmpty ? 'ergebnis' : _event!.name.trim();
-    final safeName = eventName.replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '_');
-    return 'coachsplit_${safeName}_${DateTime.now().millisecondsSinceEpoch}.png';
+  String _resultPngName() {
+    final safeName = (_event?.name ?? 'Ergebnis').replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '_');
+    return 'coachsplit_${safeName}.png';
+  }
+
+  Future<File> _writePngFile(Uint8List bytes, {bool persistent = false}) async {
+    final Directory dir;
+    if (persistent) {
+      dir = (await getDownloadsDirectory()) ?? (await getExternalStorageDirectory()) ?? await getApplicationDocumentsDirectory();
+    } else {
+      dir = await getTemporaryDirectory();
+    }
+    final file = File('${dir.path}/${_resultPngName()}');
+    await file.writeAsBytes(bytes, flush: true);
+    return file;
+  }
+
+  Future<void> _downloadPng(Uint8List bytes) async {
+    if (kIsWeb) {
+      downloadBytes(bytes, _resultPngName(), 'image/png');
+      _show('PNG heruntergeladen');
+      return;
+    }
+    final file = await _writePngFile(bytes, persistent: true);
+    _show('PNG gespeichert: ${file.path}');
+  }
+
+  Future<void> _sharePng(Uint8List bytes) async {
+    try {
+      final file = await _writePngFile(bytes);
+      await Share.shareXFiles([XFile(file.path)], text: 'CoachSplit Ergebnis: ${_event?.name ?? ''}');
+    } catch (_) {
+      if (kIsWeb) {
+        downloadBytes(bytes, _resultPngName(), 'image/png');
+        _show('Teilen nicht verfügbar – PNG wurde heruntergeladen');
+      } else {
+        rethrow;
+      }
+    }
   }
 
   Future<void> _exportPngImage() async {
     try {
-      final pngBytes = await _createResultsPngBytes();
-      final fileName = _safeExportFileName();
-      final xFile = XFile.fromData(
-        pngBytes,
-        mimeType: 'image/png',
-        name: fileName,
-        lastModified: DateTime.now(),
+      final bytes = await _createResultsPngBytes();
+      if (!mounted) return;
+      final isDesktop = MediaQuery.of(context).size.width >= 800;
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: const Color(0xFF0B1118),
+        builder: (sheetContext) => SafeArea(
+          child: FractionallySizedBox(
+            heightFactor: 0.94,
+            child: Column(children: [
+              ListTile(
+                title: const Text('Ergebnisvorschau'),
+                subtitle: const Text('Zoomen und verschieben, danach herunterladen oder teilen.'),
+                trailing: IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(sheetContext)),
+              ),
+              Expanded(
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 12),
+                  color: Colors.black,
+                  child: InteractiveViewer(
+                    minScale: 0.4,
+                    maxScale: 5,
+                    constrained: false,
+                    boundaryMargin: const EdgeInsets.all(80),
+                    child: Image.memory(bytes, fit: BoxFit.contain),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
+                  FilledButton.icon(onPressed: () => _downloadPng(bytes), icon: const Icon(Icons.download), label: const Text('PNG herunterladen')),
+                  if (!isDesktop) OutlinedButton.icon(onPressed: () => _sharePng(bytes), icon: const Icon(Icons.ios_share), label: const Text('Teilen')),
+                  TextButton(onPressed: () => Navigator.pop(sheetContext), child: const Text('Schließen')),
+                ]),
+              ),
+            ]),
+          ),
+        ),
       );
-
-      await Share.shareXFiles(
-        [xFile],
-        text: 'CoachSplit Ergebnis: ${_event?.name ?? ''}',
-        subject: 'CoachSplit Ergebnis',
-      );
-      _show('Bildexport erstellt');
     } catch (e) {
       _show(e.toString().replaceFirst('Bad state: ', ''));
     }
@@ -1752,10 +1836,16 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   Widget build(BuildContext context) {
     final event = _event;
     return Scaffold(
-      appBar: AppBar(title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('CoachSplit 1.03'),
-        Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.intervalSeconds}s · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
-      ])),
+      appBar: AppBar(
+        title: Row(children: [
+          Image.asset('assets/icon/coachsplit_icon.png', width: 38, height: 38),
+          const SizedBox(width: 10),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('CoachSplit 1.0.1 RC1'),
+            Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
+          ])),
+        ]),
+      ),
       body: SafeArea(
         child: Column(children: [
           _Stats(event: event),
@@ -1821,9 +1911,16 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           const SizedBox(height: 8),
           Row(children: [
             Expanded(child: OutlinedButton.icon(onPressed: () async {
-              final picked = await showTimePicker(context: context, initialTime: _firstStartTime);
+              final picked = await showTimePicker(
+                context: context,
+                initialTime: _firstStartTime,
+                builder: (context, child) => MediaQuery(
+                  data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
+                  child: child!,
+                ),
+              );
               if (picked != null) { setState(() => _firstStartTime = picked); _scheduleSetupAutosave(); }
-            }, icon: const Icon(Icons.schedule), label: Text('Start: ${_firstStartTime.format(context)}'))),
+            }, icon: const Icon(Icons.schedule), label: Text('Start: ${_formatTimeOfDay24(_firstStartTime)}'))),
             const SizedBox(width: 8),
             DropdownButton<int>(value: _intervalSeconds, items: const [DropdownMenuItem(value: 15, child: Text('15s')), DropdownMenuItem(value: 30, child: Text('30s')), DropdownMenuItem(value: 60, child: Text('60s'))], onChanged: (v) {
               if (v != null) { setState(() => _intervalSeconds = v); _scheduleSetupAutosave(); }
@@ -1843,7 +1940,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
             OutlinedButton.icon(onPressed: _addSplitPointFromSetup, icon: const Icon(Icons.add_location_alt), label: const Text('Messpunkt hinzufügen')),
           ]),
           const SizedBox(height: 8),
-          TextField(controller: _pointsText, maxLines: 5, onChanged: (_) => _scheduleSetupAutosave(), decoration: const InputDecoration(labelText: 'Messpunkte', hintText: 'Anstieg, split\nZiel, ziel', alignLabelWithHint: true)),
+          TextField(controller: _pointsText, maxLines: 5, onChanged: (_) => _scheduleSetupAutosave(), decoration: const InputDecoration(labelText: 'Messpunkte', hintText: 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel', alignLabelWithHint: true)),
           const SizedBox(height: 12),
           const SizedBox(height: 8),
           FilledButton.icon(onPressed: _goToStart, icon: const Icon(Icons.arrow_forward), label: const Text('Zum Start')),
@@ -1872,7 +1969,6 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final running = event.athletes.where((a) => a.status == AthleteStatus.running).toList();
     final finished = event.athletes.where((a) => a.status == AthleteStatus.finished).toList().reversed.take(5).toList();
     return ListView(padding: const EdgeInsets.all(12), children: [
-        const Card(child: Padding(padding: EdgeInsets.all(16), child: Center(child: CoachSplitLogo(size: 78, showText: true)))),
       _Section(title: 'Startliste', subtitle: 'Countdown + manueller Start + Massenstart bis 15', child: Column(children: [
         if (waiting.isNotEmpty) Padding(
           padding: const EdgeInsets.only(bottom: 8),
@@ -1887,7 +1983,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
             const SizedBox(width: 8),
             Expanded(
               child: OutlinedButton.icon(
-                onPressed: () => setState(() => _autoStartEnabled = !_autoStartEnabled),
+                onPressed: _toggleAutoStart,
                 icon: Icon(_autoStartEnabled ? Icons.timer : Icons.timer_off),
                 label: Text(_autoStartEnabled ? 'AutoStart EIN' : 'AutoStart AUS'),
               ),

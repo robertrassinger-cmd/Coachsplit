@@ -1,0 +1,26 @@
+name: Build CoachSplit
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+      - name: Prepare Android platform
+        run: flutter create . --platforms=android
+      - run: dart run flutter_launcher_icons
+      - run: flutter build apk --release
+      - run: flutter build web --release --no-wasm-dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CoachSplit-1.0.1-RC1
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/web
