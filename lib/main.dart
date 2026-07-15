@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'web_download_stub.dart' if (dart.library.html) 'web_download_web.dart';
+import 'services/competition_clock.dart';
 
 void main() => runApp(const CoachSplitApp());
 
@@ -47,8 +48,24 @@ class CoachSplitApp extends StatelessWidget {
   }
 }
 
-enum PointType { split, finish }
-enum AthleteStatus { waiting, running, finished }
+enum PointType { split, shootingEntry, shootingExit, finish }
+enum AthleteStatus { waiting, running, finished, didNotFinish }
+enum CompetitionStatus { draft, running, finished, archived }
+enum ShootingPosition { prone, standing }
+
+class ShootingResult {
+  ShootingResult({required this.position, required this.misses});
+  ShootingPosition position;
+  int misses;
+  Map<String, dynamic> toJson() => {'position': position.name, 'misses': misses};
+  static ShootingResult fromJson(Map<String, dynamic> json) => ShootingResult(
+        position: ShootingPosition.values.firstWhere(
+          (value) => value.name == json['position'],
+          orElse: () => ShootingPosition.prone,
+        ),
+        misses: ((json['misses'] as num?)?.toInt() ?? 0).clamp(0, 5) as int,
+      );
+}
 
 class Athlete {
   Athlete({
@@ -60,7 +77,9 @@ class Athlete {
     this.actualStart,
     this.status = AthleteStatus.waiting,
     Map<String, DateTime>? captures,
-  }) : captures = captures ?? {};
+    Map<String, ShootingResult>? shootingResults,
+  })  : captures = captures ?? {},
+        shootingResults = shootingResults ?? {};
 
   int bib;
   String name;
@@ -70,6 +89,7 @@ class Athlete {
   DateTime? actualStart;
   AthleteStatus status;
   Map<String, DateTime> captures;
+  Map<String, ShootingResult> shootingResults;
 
   DateTime get startTime => actualStart ?? scheduledStart;
 
@@ -82,10 +102,11 @@ class Athlete {
         'actualStart': actualStart?.toIso8601String(),
         'status': status.name,
         'captures': captures.map((k, v) => MapEntry(k, v.toIso8601String())),
+        'shootingResults': shootingResults.map((k, v) => MapEntry(k, v.toJson())),
       };
 
   static Athlete fromJson(Map<String, dynamic> json) => Athlete(
-        bib: json['bib'] as int,
+        bib: (json['bib'] as num).toInt(),
         name: json['name'] as String,
         category: json['category'] as String,
         isOwn: json['isOwn'] as bool,
@@ -93,23 +114,41 @@ class Athlete {
         actualStart: json['actualStart'] == null ? null : DateTime.parse(json['actualStart'] as String),
         status: AthleteStatus.values.firstWhere((s) => s.name == json['status'], orElse: () => AthleteStatus.waiting),
         captures: (json['captures'] as Map<String, dynamic>? ?? {}).map((k, v) => MapEntry(k, DateTime.parse(v as String))),
+        shootingResults: (json['shootingResults'] as Map<String, dynamic>? ?? {}).map(
+          (k, v) => MapEntry(k, ShootingResult.fromJson(v as Map<String, dynamic>)),
+        ),
       );
 }
 
 class SplitPoint {
-  SplitPoint({required this.id, required this.name, required this.type});
+  SplitPoint({required this.id, required this.name, required this.type, this.shootingRangeNumber, this.trainerNote});
 
   String id;
   String name;
   PointType type;
+  int? shootingRangeNumber;
+  String? trainerNote;
 
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'type': type.name};
+  bool get requiresShootingData => type == PointType.shootingExit;
 
-  static SplitPoint fromJson(Map<String, dynamic> json) => SplitPoint(
-        id: json['id'] as String,
-        name: json['name'] as String,
-        type: json['type'] == 'finish' ? PointType.finish : PointType.split,
-      );
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'type': type.name,
+        'shootingRangeNumber': shootingRangeNumber,
+        'trainerNote': trainerNote,
+      };
+
+  static SplitPoint fromJson(Map<String, dynamic> json) {
+    final rawType = json['type'] as String? ?? 'split';
+    return SplitPoint(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      type: PointType.values.firstWhere((type) => type.name == rawType, orElse: () => rawType == 'finish' ? PointType.finish : PointType.split),
+      shootingRangeNumber: (json['shootingRangeNumber'] as num?)?.toInt(),
+      trainerNote: json['trainerNote'] as String?,
+    );
+  }
 }
 
 class RaceEvent {
@@ -120,6 +159,11 @@ class RaceEvent {
     required this.compareByCategory,
     required this.athletes,
     required this.points,
+    this.timePenaltyEnabled = false,
+    this.penaltySecondsPerMiss = 0,
+    this.clockCalibration,
+    this.status = CompetitionStatus.draft,
+    this.schemaVersion = 3,
   });
 
   String name;
@@ -128,23 +172,45 @@ class RaceEvent {
   bool compareByCategory;
   List<Athlete> athletes;
   List<SplitPoint> points;
+  bool timePenaltyEnabled;
+  int penaltySecondsPerMiss;
+  CompetitionClockCalibration? clockCalibration;
+  CompetitionStatus status;
+  int schemaVersion;
 
   Map<String, dynamic> toJson() => {
+        'schemaVersion': schemaVersion,
         'name': name,
         'firstStart': firstStart.toIso8601String(),
         'intervalSeconds': intervalSeconds,
         'compareByCategory': compareByCategory,
         'athletes': athletes.map((a) => a.toJson()).toList(),
         'points': points.map((p) => p.toJson()).toList(),
+        'timePenaltyEnabled': timePenaltyEnabled,
+        'penaltySecondsPerMiss': penaltySecondsPerMiss,
+        'clockCalibration': clockCalibration?.toJson(),
+        'status': status.name,
       };
 
   static RaceEvent fromJson(Map<String, dynamic> json) => RaceEvent(
         name: json['name'] as String,
         firstStart: DateTime.parse(json['firstStart'] as String),
-        intervalSeconds: json['intervalSeconds'] as int,
+        intervalSeconds: (json['intervalSeconds'] as num).toInt(),
         compareByCategory: json['compareByCategory'] as bool,
         athletes: (json['athletes'] as List<dynamic>).map((a) => Athlete.fromJson(a as Map<String, dynamic>)).toList(),
         points: (json['points'] as List<dynamic>).map((p) => SplitPoint.fromJson(p as Map<String, dynamic>)).toList(),
+        timePenaltyEnabled: json['timePenaltyEnabled'] as bool? ?? false,
+        penaltySecondsPerMiss: (json['penaltySecondsPerMiss'] as num?)?.toInt() ?? 0,
+        clockCalibration: json['clockCalibration'] == null
+            ? null
+            : CompetitionClockCalibration.fromJson(json['clockCalibration'] as Map<String, dynamic>),
+        status: CompetitionStatus.values.firstWhere(
+          (value) => value.name == json['status'],
+          orElse: () => (json['athletes'] as List<dynamic>? ?? const []).any((a) => (a as Map<String, dynamic>)['status'] != 'waiting')
+              ? CompetitionStatus.running
+              : CompetitionStatus.draft,
+        ),
+        schemaVersion: (json['schemaVersion'] as num?)?.toInt() ?? 1,
       );
 }
 
@@ -189,7 +255,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
   final _eventName = TextEditingController(text: 'Trainingsrennen Demo');
   final _athletesText = TextEditingController(text: _defaultAthletes);
-  final _pointsText = TextEditingController(text: 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel');
+  final _pointsText = TextEditingController(text: 'Zwischenzeit 1, split\nZiel, ziel');
   final _groupsText = TextEditingController(text: _defaultGroups);
 
   final Map<String, RaceEvent> _savedEvents = {};
@@ -204,6 +270,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   int _intervalSeconds = 30;
   bool _compareByCategory = false;
   bool _autoStartEnabled = false;
+  bool _timePenaltyEnabled = false;
+  int _penaltySecondsPerMiss = 30;
+  final CompetitionClock _competitionClock = CompetitionClock();
   TimeOfDay _firstStartTime = TimeOfDay.fromDateTime(DateTime.now().add(const Duration(minutes: 2)));
 
   Timer? _timer;
@@ -317,6 +386,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
         firstStart: firstStart,
         intervalSeconds: _intervalSeconds,
         compareByCategory: _compareByCategory,
+        timePenaltyEnabled: _timePenaltyEnabled,
+        penaltySecondsPerMiss: _penaltySecondsPerMiss,
+        clockCalibration: _competitionClock.calibration,
         athletes: athletes,
         points: points,
       );
@@ -342,6 +414,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   }
 
   Future<void> _saveSetupFromFields() async {
+    if (_event?.status == CompetitionStatus.running) return;
     if (_viewingArchivedEvent) return;
     final current = _event;
     if (_hasRaceData(current)) {
@@ -357,6 +430,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       firstStart: firstStart,
       intervalSeconds: _intervalSeconds,
       compareByCategory: _compareByCategory,
+      timePenaltyEnabled: _timePenaltyEnabled,
+      penaltySecondsPerMiss: _penaltySecondsPerMiss,
+      clockCalibration: _competitionClock.calibration,
       athletes: _parseAthletes(_athletesText.text, firstStart),
       points: _parsePoints(_pointsText.text),
     );
@@ -387,80 +463,93 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   String _suggestPointName(List<SplitPoint> points, String type) {
     switch (type) {
       case 'round': return _nextPointName(points, 'Runde');
-      case 'shootIn': return _nextPointName(points, 'Schießstand ein');
-      case 'shootOut': return _nextPointName(points, 'Schießstand aus');
-      default: return _nextPointName(points, 'Messpunkt');
+      case 'custom': return _nextPointName(points, 'Messpunkt');
+      default: return _nextPointName(points, 'Zwischenzeit');
     }
   }
 
-  Future<SplitPoint?> _pointFromTemplateDialog(List<SplitPoint> points) async {
-    var type = 'point';
-    final controller = TextEditingController(text: _suggestPointName(points, type));
-    return showDialog<SplitPoint>(
+  int _nextShootingRangeNumber(List<SplitPoint> points) {
+    final values = points.map((p) => p.shootingRangeNumber ?? 0);
+    return values.isEmpty ? 1 : values.reduce(max) + 1;
+  }
+
+  Future<List<SplitPoint>?> _pointFromTemplateDialog(List<SplitPoint> points) async {
+    return showModalBottomSheet<List<SplitPoint>>(
       context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Messpunkt hinzufügen'),
-          content: Column(mainAxisSize: MainAxisSize.min, children: [
-            DropdownButtonFormField<String>(
-              value: type,
-              decoration: const InputDecoration(labelText: 'Vorlage'),
-              items: const [
-                DropdownMenuItem(value: 'point', child: Text('Messpunkt')),
-                DropdownMenuItem(value: 'round', child: Text('Runde')),
-                DropdownMenuItem(value: 'shootIn', child: Text('Schießstand ein')),
-                DropdownMenuItem(value: 'shootOut', child: Text('Schießstand aus')),
-              ],
-              onChanged: (value) {
-                if (value == null) return;
-                setDialogState(() {
-                  type = value;
-                  controller.text = _suggestPointName(points, type);
-                });
-              },
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              decoration: const InputDecoration(labelText: 'Name', helperText: 'Der Vorschlag kann angepasst werden.'),
-            ),
-          ]),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
-            FilledButton(
-              onPressed: () {
-                final name = controller.text.trim().isEmpty ? _suggestPointName(points, type) : controller.text.trim();
-                Navigator.pop(context, SplitPoint(
-                  id: 'p_${DateTime.now().microsecondsSinceEpoch}',
-                  name: name,
-                  type: PointType.split,
-                ));
-              },
-              child: const Text('Hinzufügen'),
-            ),
-          ],
-        ),
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => Padding(
+        padding: EdgeInsets.fromLTRB(16, 4, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Messpunkt hinzufügen', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Text('Der neue Messpunkt wird automatisch vor dem Ziel eingefügt.'),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            onPressed: () {
+              final now = DateTime.now().microsecondsSinceEpoch;
+              Navigator.pop(context, [SplitPoint(id: 'p_$now', name: _suggestPointName(points, 'split'), type: PointType.split)]);
+            },
+            icon: const Icon(Icons.timer_outlined),
+            label: const Text('Zwischenzeit'),
+          ),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: () {
+              final number = _nextShootingRangeNumber(points);
+              final base = 'shoot_${DateTime.now().microsecondsSinceEpoch}';
+              Navigator.pop(context, [
+                SplitPoint(id: '${base}_in', name: 'Schießstand $number ein', type: PointType.shootingEntry, shootingRangeNumber: number),
+                SplitPoint(id: '${base}_out', name: 'Schießstand $number aus', type: PointType.shootingExit, shootingRangeNumber: number),
+              ]);
+            },
+            icon: const Icon(Icons.my_location),
+            label: const Text('Schießstand'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: () async {
+              final controller = TextEditingController(text: _suggestPointName(points, 'custom'));
+              final name = await showDialog<String>(
+                context: context,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('Freier Messpunkt'),
+                  content: TextField(controller: controller, autofocus: true, decoration: const InputDecoration(labelText: 'Bezeichnung')),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Abbrechen')),
+                    FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Hinzufügen')),
+                  ],
+                ),
+              );
+              if (name != null && name.isNotEmpty && context.mounted) {
+                Navigator.pop(context, [SplitPoint(id: 'p_${DateTime.now().microsecondsSinceEpoch}', name: name, type: PointType.split)]);
+              }
+            },
+            icon: const Icon(Icons.edit_outlined),
+            label: const Text('Freier Messpunkt'),
+          ),
+        ]),
       ),
     );
   }
 
   Future<void> _addSplitPointFromSetup() async {
     final points = _parsePoints(_pointsText.text);
-    final newPoint = await _pointFromTemplateDialog(points);
-    if (newPoint == null) return;
+    final newPoints = await _pointFromTemplateDialog(points);
+    if (newPoints == null || newPoints.isEmpty) return;
     final finishIndex = points.lastIndexWhere((p) => p.type == PointType.finish);
     if (finishIndex >= 0) {
-      points.insert(finishIndex, newPoint);
+      points.insertAll(finishIndex, newPoints);
     } else {
-      points.add(newPoint);
+      points.addAll(newPoints);
       points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
     }
     setState(() {
-      _pointsText.text = points.map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}').join('\n');
+      _pointsText.text = points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
       if (_event != null && !_hasRaceData()) _event!.points = points;
     });
     await _saveSetupFromFields();
-    _show('Messpunkt hinzugefügt');
+    _show(newPoints.length == 2 ? 'Schießstand hinzugefügt' : 'Messpunkt hinzugefügt');
   }
 
   Future<void> _archiveCurrentEvent() async {
@@ -469,6 +558,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     event.name = _eventName.text.trim().isEmpty ? event.name : _eventName.text.trim();
     final copy = RaceEvent.fromJson(event.toJson());
+    copy.status = CompetitionStatus.archived;
 
     _archivedEvents[copy.name] = copy;
     _savedEvents.remove(copy.name);
@@ -488,6 +578,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _eventName.text = copy.name;
       _intervalSeconds = copy.intervalSeconds;
       _compareByCategory = copy.compareByCategory;
+      _timePenaltyEnabled = copy.timePenaltyEnabled;
+      _penaltySecondsPerMiss = copy.penaltySecondsPerMiss;
+      _competitionClock.restore(copy.clockCalibration);
       _autoStartEnabled = false;
       _setupReady = true;
       _currentEventKey = null;
@@ -496,7 +589,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           .map((a) => '${a.bib}, ${a.name}, ${a.category}${a.isOwn ? ', *' : ''}, ${_formatClock(a.scheduledStart)}')
           .join('\n');
       _pointsText.text = copy.points
-          .map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}')
+          .map((p) => '${p.name}, ${_pointTypeToken(p)}')
           .join('\n');
       _page = 3;
     });
@@ -560,13 +653,16 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _eventName.text = copy.name;
       _intervalSeconds = copy.intervalSeconds;
       _compareByCategory = copy.compareByCategory;
+      _timePenaltyEnabled = copy.timePenaltyEnabled;
+      _penaltySecondsPerMiss = copy.penaltySecondsPerMiss;
+      _competitionClock.restore(copy.clockCalibration);
       _autoStartEnabled = false;
       _firstStartTime = TimeOfDay.fromDateTime(copy.firstStart);
       _athletesText.text = copy.athletes
           .map((a) => '${a.bib}, ${a.name}, ${a.category}${a.isOwn ? ', *' : ''}, ${_formatClock(a.scheduledStart)}')
           .join('\n');
       _pointsText.text = copy.points
-          .map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}')
+          .map((p) => '${p.name}, ${_pointTypeToken(p)}')
           .join('\n');
       _page = 0;
     });
@@ -603,6 +699,15 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return result;
   }
 
+  String _pointTypeToken(SplitPoint point) {
+    switch (point.type) {
+      case PointType.finish: return 'ziel';
+      case PointType.shootingEntry: return 'shootingEntry';
+      case PointType.shootingExit: return 'shootingExit';
+      case PointType.split: return 'split';
+    }
+  }
+
   List<SplitPoint> _parsePoints(String text) {
     final lines = text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
     final splits = <SplitPoint>[];
@@ -611,13 +716,20 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       final rawName = parts.isNotEmpty ? parts[0] : '';
       final typeRaw = parts.length > 1 ? parts[1].toLowerCase() : 'split';
       final isFinish = typeRaw.contains('ziel') || typeRaw.contains('finish') || rawName.toLowerCase() == 'ziel';
-      if (!isFinish) {
-        splits.add(SplitPoint(
-          id: 'p_$i',
-          name: rawName.isEmpty ? 'Messpunkt ${splits.length + 1}' : rawName,
-          type: PointType.split,
-        ));
-      }
+      if (isFinish) continue;
+      final numberMatch = RegExp(r'(\d+)').firstMatch(rawName);
+      final rangeNumber = numberMatch == null ? null : int.tryParse(numberMatch.group(1)!);
+      final type = typeRaw.contains('shootingentry') || rawName.toLowerCase().contains('schießstand') && rawName.toLowerCase().endsWith(' ein')
+          ? PointType.shootingEntry
+          : typeRaw.contains('shootingexit') || rawName.toLowerCase().contains('schießstand') && rawName.toLowerCase().endsWith(' aus')
+              ? PointType.shootingExit
+              : PointType.split;
+      splits.add(SplitPoint(
+        id: 'p_${i}_${type.name}',
+        name: rawName.isEmpty ? 'Messpunkt ${splits.length + 1}' : rawName,
+        type: type,
+        shootingRangeNumber: rangeNumber,
+      ));
     }
     return [...splits, SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish)];
   }
@@ -650,6 +762,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     current.name = eventName;
     current.intervalSeconds = _intervalSeconds;
     current.compareByCategory = _compareByCategory;
+    current.timePenaltyEnabled = _timePenaltyEnabled;
+    current.penaltySecondsPerMiss = _penaltySecondsPerMiss;
+    current.clockCalibration = _competitionClock.calibration;
 
     final previousKey = _currentEventKey;
     if (previousKey != null && previousKey != eventName && _savedEvents.containsKey(previousKey)) {
@@ -679,14 +794,20 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _eventName.text = _uniqueEventName('Neuer Bewerb $stamp');
       _intervalSeconds = 30;
       _compareByCategory = false;
+      _timePenaltyEnabled = false;
+      _penaltySecondsPerMiss = 30;
+      _competitionClock.clear();
       _autoStartEnabled = false;
       _athletesText.text = _defaultAthletes;
-      _pointsText.text = 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel';
+      _pointsText.text = 'Zwischenzeit 1, split\nZiel, ziel';
       _event = RaceEvent(
         name: _eventName.text,
         firstStart: now,
         intervalSeconds: _intervalSeconds,
         compareByCategory: _compareByCategory,
+        timePenaltyEnabled: _timePenaltyEnabled,
+        penaltySecondsPerMiss: _penaltySecondsPerMiss,
+        clockCalibration: _competitionClock.calibration,
         athletes: _parseAthletes(_athletesText.text, now),
         points: _parsePoints(_pointsText.text),
       );
@@ -713,6 +834,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
         firstStart: firstStart,
         intervalSeconds: _intervalSeconds,
         compareByCategory: _compareByCategory,
+        timePenaltyEnabled: _timePenaltyEnabled,
+        penaltySecondsPerMiss: _penaltySecondsPerMiss,
+        clockCalibration: _competitionClock.calibration,
         athletes: athletes,
         points: points,
       );
@@ -722,7 +846,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           .join('\n');
 
       _pointsText.text = points
-          .map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}')
+          .map((p) => '${p.name}, ${_pointTypeToken(p)}')
           .join('\n');
     });
 
@@ -731,11 +855,13 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   }
 
   void _goToStart() {
+    _setupAutosaveTimer?.cancel();
     final hasRaceData = _hasRaceData();
     if (!hasRaceData) {
       _createEventFromSetup(silent: true);
     }
     _setupReady = true;
+    if (_event != null) _event!.status = CompetitionStatus.running;
     _saveEvent();
     setState(() => _page = 1);
   }
@@ -743,20 +869,136 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   Future<void> _addSplitPointFromCapture() async {
     final event = _event;
     if (event == null) return;
-    final newPoint = await _pointFromTemplateDialog(event.points);
-    if (newPoint == null) return;
+    final newPoints = await _pointFromTemplateDialog(event.points);
+    if (newPoints == null || newPoints.isEmpty) return;
     setState(() {
       final finishIndex = event.points.lastIndexWhere((p) => p.type == PointType.finish);
       if (finishIndex >= 0) {
-        event.points.insert(finishIndex, newPoint);
+        event.points.insertAll(finishIndex, newPoints);
       } else {
-        event.points.add(newPoint);
+        event.points.addAll(newPoints);
         event.points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
       }
-      _pointsText.text = event.points.map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}').join('\n');
+      _pointsText.text = event.points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
     });
     await _saveEvent();
-    _show('Messpunkt hinzugefügt');
+    _show(newPoints.length == 2 ? 'Schießstand hinzugefügt' : 'Messpunkt hinzugefügt');
+  }
+
+  bool _pointHasCaptures(SplitPoint point) {
+    final event = _event;
+    if (event == null) return false;
+    final key = _key(point);
+    return event.athletes.any((athlete) => athlete.captures.containsKey(key));
+  }
+
+  Future<void> _editPointDuringRace(SplitPoint point) async {
+    final event = _event;
+    if (event == null) return;
+    final nameController = TextEditingController(text: point.name);
+    final noteController = TextEditingController(text: point.trainerNote ?? '');
+    final used = point.shootingRangeNumber == null
+        ? _pointHasCaptures(point)
+        : event.points.where((candidate) => candidate.shootingRangeNumber == point.shootingRangeNumber).any(_pointHasCaptures);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Messpunkt bearbeiten'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameController, decoration: const InputDecoration(labelText: 'Bezeichnung')),
+          const SizedBox(height: 8),
+          TextField(controller: noteController, maxLines: 2, decoration: const InputDecoration(labelText: 'Standorthinweis', hintText: 'z. B. Hügel beim großen Baum')),
+          if (used) const Padding(
+            padding: EdgeInsets.only(top: 12),
+            child: Text('Für diesen Punkt wurden bereits Zeiten erfasst. Typ und Identität bleiben deshalb geschützt.'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
+          if (!used && point.type != PointType.finish)
+            TextButton(onPressed: () => Navigator.pop(context, 'delete'), child: const Text('Löschen')),
+          FilledButton(onPressed: () => Navigator.pop(context, 'save'), child: const Text('Speichern')),
+        ],
+      ),
+    );
+    if (result == null) return;
+    if (result == 'delete') {
+      setState(() {
+        if (point.shootingRangeNumber != null) {
+          event.points.removeWhere((candidate) => candidate.shootingRangeNumber == point.shootingRangeNumber);
+        } else {
+          event.points.removeWhere((candidate) => candidate.id == point.id);
+        }
+      });
+      await _saveEvent();
+      _show(point.shootingRangeNumber != null ? 'Schießstand gelöscht' : 'Messpunkt gelöscht');
+      return;
+    }
+    final newName = nameController.text.trim();
+    if (newName.isEmpty) return;
+    setState(() {
+      point.name = newName;
+      point.trainerNote = noteController.text.trim().isEmpty ? null : noteController.text.trim();
+    });
+    await _saveEvent();
+    _show('Messpunkt aktualisiert');
+  }
+
+  Future<void> _changePenaltyDuringRace() async {
+    final event = _event;
+    if (event == null) return;
+    var enabled = event.timePenaltyEnabled;
+    var seconds = event.penaltySecondsPerMiss > 0 ? event.penaltySecondsPerMiss : 30;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(builder: (context, setLocalState) => AlertDialog(
+        title: const Text('Zeitstrafe einstellen'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Zeitstrafe pro Schießfehler'), value: enabled, onChanged: (value) => setLocalState(() => enabled = value)),
+          if (enabled) DropdownButtonFormField<int>(
+            value: seconds,
+            decoration: const InputDecoration(labelText: 'Sekunden pro Fehler'),
+            items: const [15, 20, 30, 45, 60].map((value) => DropdownMenuItem(value: value, child: Text('$value Sekunden'))).toList(),
+            onChanged: (value) { if (value != null) setLocalState(() => seconds = value); },
+          ),
+          if (enabled) const Padding(
+            padding: EdgeInsets.only(top: 12),
+            child: Text('Warnung: Die Regel wird rückwirkend auf alle bereits erfassten Schießfehler angewendet. Roh- und Zielzeiten bleiben gespeichert; die offizielle Zeit wird neu berechnet.'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Abbrechen')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Übernehmen')),
+        ],
+      )),
+    );
+    if (accepted != true) return;
+    setState(() {
+      event.timePenaltyEnabled = enabled;
+      event.penaltySecondsPerMiss = enabled ? seconds : 0;
+      _timePenaltyEnabled = enabled;
+      _penaltySecondsPerMiss = seconds;
+    });
+    await _saveEvent();
+    _show(enabled ? 'Zeitstrafe aktiviert und Ergebnisse neu berechnet' : 'Zeitstrafe deaktiviert');
+  }
+
+  Future<void> _markDnf(Athlete athlete) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Athlet als DNF markieren?'),
+        content: Text('${athlete.bib} ${athlete.name} wird aus der aktiven Erfassung entfernt. Bisherige Messungen bleiben erhalten.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Abbrechen')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('DNF bestätigen')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => athlete.status = AthleteStatus.didNotFinish);
+    await _saveEvent();
+    _show('${athlete.name}: DNF');
   }
 
   Future<void> _deleteEvent(String name) async {
@@ -809,12 +1051,15 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _eventName.text = copy.name;
       _intervalSeconds = copy.intervalSeconds;
       _compareByCategory = copy.compareByCategory;
+      _timePenaltyEnabled = copy.timePenaltyEnabled;
+      _penaltySecondsPerMiss = copy.penaltySecondsPerMiss;
+      _competitionClock.restore(copy.clockCalibration);
       _firstStartTime = TimeOfDay.fromDateTime(copy.firstStart);
       _athletesText.text = copy.athletes.map((a) => '${a.bib}, ${a.name}, ${a.category}${a.isOwn ? ', *' : ''}, ${_formatClock(a.scheduledStart)}').join('\n');
-      _pointsText.text = copy.points.map((p) => '${p.name}, ${p.type == PointType.finish ? 'ziel' : 'split'}').join('\n');
+      _pointsText.text = copy.points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
       _autoStartEnabled = false;
-      _setupReady = _hasRaceData(copy);
-      _page = 0;
+      _setupReady = copy.status != CompetitionStatus.draft || _hasRaceData(copy);
+      _page = _setupReady ? 1 : 0;
     });
     _show('Bewerb geladen: ${copy.name}');
   }
@@ -940,7 +1185,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     setState(() {
       athlete.status = AthleteStatus.running;
-      athlete.actualStart = DateTime.now();
+      athlete.actualStart = _competitionClock.nowDateTime();
     });
 
     _undoSnack('${athlete.bib} ${athlete.name} gestartet', () {
@@ -959,7 +1204,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final waiting = event.athletes.where((a) => a.status == AthleteStatus.waiting).take(15).toList();
     if (waiting.isEmpty) return;
 
-    final now = DateTime.now();
+    final now = _competitionClock.nowDateTime();
     final old = waiting.map((a) => MapEntry(a, MapEntry(a.status, a.actualStart))).toList();
 
     setState(() {
@@ -1058,16 +1303,64 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     );
   }
 
-  void _capture(Athlete athlete, SplitPoint point) {
+  Future<ShootingResult?> _shootingResultDialog(Athlete athlete, SplitPoint point) async {
+    ShootingPosition? position;
+    int? misses;
+    return showDialog<ShootingResult>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('${athlete.bib} ${athlete.name} · ${point.name}'),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const Text('Anschlag', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            SegmentedButton<ShootingPosition>(
+              segments: const [
+                ButtonSegment(value: ShootingPosition.prone, label: Text('L'), icon: Icon(Icons.horizontal_rule)),
+                ButtonSegment(value: ShootingPosition.standing, label: Text('S'), icon: Icon(Icons.accessibility_new)),
+              ],
+              selected: position == null ? <ShootingPosition>{} : {position!},
+              emptySelectionAllowed: true,
+              onSelectionChanged: (selection) => setDialogState(() => position = selection.isEmpty ? null : selection.first),
+            ),
+            const SizedBox(height: 16),
+            const Text('Schießfehler', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              for (var value = 0; value <= 5; value++)
+                ChoiceChip(label: Text('$value'), selected: misses == value, onSelected: (_) => setDialogState(() => misses = value)),
+            ]),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
+            FilledButton(
+              onPressed: position == null || misses == null ? null : () => Navigator.pop(context, ShootingResult(position: position!, misses: misses!)),
+              child: const Text('Zeit übernehmen'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _capture(Athlete athlete, SplitPoint point) async {
     if (athlete.status != AthleteStatus.running) return;
     final key = _key(point);
     if (athlete.captures.containsKey(key)) return;
 
+    ShootingResult? shootingResult;
+    if (point.requiresShootingData) {
+      shootingResult = await _shootingResultDialog(athlete, point);
+      if (shootingResult == null) return;
+    }
+
     final oldStatus = athlete.status;
-    final now = DateTime.now();
+    final now = _competitionClock.nowDateTime();
 
     setState(() {
       athlete.captures[key] = now;
+      if (shootingResult != null) athlete.shootingResults[key] = shootingResult;
       if (point.type == PointType.finish) athlete.status = AthleteStatus.finished;
     });
     _saveEvent();
@@ -1075,9 +1368,10 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     _undoSnack(_feedbackText(athlete, point), () {
       setState(() {
         athlete.captures.remove(key);
+        athlete.shootingResults.remove(key);
         athlete.status = oldStatus;
       });
-    });
+    }, duration: point.type == PointType.shootingExit ? const Duration(seconds: 4) : const Duration(seconds: 2));
   }
 
   String _feedbackText(Athlete athlete, SplitPoint point) {
@@ -1090,8 +1384,29 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       return '✓ ${athlete.bib} ${athlete.name} · Ziel · ${_fmtDuration(row.elapsed)} · Pl ${row.place} · +${_fmtDuration(row.deltaToLeader)}';
     }
 
+    if (point.type == PointType.shootingExit) {
+      final result = athlete.shootingResults[_key(point)];
+      final position = result?.position == ShootingPosition.prone ? 'L' : 'S';
+      final placement = _placementGapFeedback(rows, row);
+      return '✓ ${athlete.bib} ${athlete.name} · ${point.name} · $position · ${result?.misses ?? 0} Fehler · $placement';
+    }
+
     final trend = row.sectionDelta == null ? 'Trend —' : 'Trend +${_fmtDuration(row.sectionDelta!)}';
     return '✓ ${athlete.bib} ${athlete.name} · ${point.name} · Pl ${row.place} · +${_fmtDuration(row.deltaToLeader)} · $trend';
+  }
+
+  String _placementGapFeedback(List<RankRow> rows, RankRow row) {
+    final sameGroup = rows.where((candidate) => _group(candidate.athlete) == _group(row.athlete)).toList()
+      ..sort((a, b) => a.place.compareTo(b.place));
+
+    if (row.place == 1) {
+      final second = sameGroup.where((candidate) => candidate.place == 2).toList();
+      if (second.isEmpty) return 'Pl 1 · führend';
+      final advantage = second.first.elapsed - row.elapsed;
+      return 'Pl 1 · ${_fmtDuration(advantage)} Vorsprung';
+    }
+
+    return 'Pl ${row.place} · ${_fmtDuration(row.deltaToLeader)} Rückstand';
   }
 
   String _key(SplitPoint point) => point.type == PointType.finish ? 'finish:${point.id}' : point.id;
@@ -1217,6 +1532,19 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return candidates.take(isFirstPoint ? 15 : 6).toList();
   }
 
+  int _totalMisses(Athlete athlete) => athlete.shootingResults.values.fold(0, (sum, result) => sum + result.misses);
+
+  Duration _penaltyFor(Athlete athlete) {
+    final event = _event;
+    if (event == null || !event.timePenaltyEnabled || event.penaltySecondsPerMiss <= 0) return Duration.zero;
+    return Duration(seconds: _totalMisses(athlete) * event.penaltySecondsPerMiss);
+  }
+
+  Duration _officialElapsed(Athlete athlete, SplitPoint point, DateTime time) {
+    final raw = _elapsed(athlete, time);
+    return point.type == PointType.finish ? raw + _penaltyFor(athlete) : raw;
+  }
+
   List<RankRow> _ranking(SplitPoint point) {
     final event = _event;
     if (event == null) return [];
@@ -1224,7 +1552,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     for (final athlete in event.athletes) {
       final time = _captureTime(athlete, point);
       if (time == null) continue;
-      raw.add(MapEntry(athlete, _elapsed(athlete, time)));
+      raw.add(MapEntry(athlete, _officialElapsed(athlete, point, time)));
     }
 
     final grouped = <String, List<MapEntry<Athlete, Duration>>>{};
@@ -1817,11 +2145,75 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     );
   }
 
+  Widget _competitionClockCard() {
+    final calibration = _competitionClock.calibration;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            const Expanded(child: Text('Offizielle Wettkampfuhr', style: TextStyle(fontWeight: FontWeight.bold))),
+            Text(_competitionClock.formatNow()),
+          ]),
+          const SizedBox(height: 4),
+          Text(
+            calibration == null
+                ? 'Nicht kalibriert · Administratorzeit wird als gemeinsame Basis verwendet.'
+                : 'Kalibriert · ${calibration.officialReferenceLabel}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _calibrateCompetitionClock,
+            icon: const Icon(Icons.sync),
+            label: Text(calibration == null ? 'Wettkampfuhr kalibrieren' : 'Neu kalibrieren'),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _calibrateCompetitionClock() async {
+    final target = DateTime.now().add(const Duration(minutes: 1));
+    final controller = TextEditingController(text: _formatClock(target));
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Wettkampfuhr kalibrieren'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('Eine Uhrzeit knapp in der Zukunft eingeben. Sobald die offizielle Wettkampfuhr diese Zeit erreicht, „Jetzt übernehmen“ drücken.'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType: TextInputType.datetime,
+            decoration: const InputDecoration(labelText: 'HH:MM:SS', helperText: 'Beispiel: 10:32:00'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Abbrechen')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Jetzt übernehmen')),
+        ],
+      ),
+    );
+    if (accepted != true) return;
+    final parsed = _parseClock(controller.text);
+    if (parsed == null) { _show('Ungültige Uhrzeit'); return; }
+    final localNow = DateTime.now();
+    var official = DateTime(localNow.year, localNow.month, localNow.day, parsed.$1, parsed.$2, parsed.$3);
+    if (official.difference(localNow).inHours.abs() > 12) {
+      official = official.isBefore(localNow) ? official.add(const Duration(days: 1)) : official.subtract(const Duration(days: 1));
+    }
+    setState(() => _competitionClock.calibrate(officialTime: official, capturedDeviceTime: localNow));
+    await _saveEvent();
+    _show('Wettkampfuhr kalibriert');
+  }
+
   void _show(String text) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
 
-  void _undoSnack(String text, VoidCallback onUndo) {
+  void _undoSnack(String text, VoidCallback onUndo, {Duration duration = const Duration(seconds: 2)}) {
     ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(duration: const Duration(seconds: 2), content: Text(text), action: SnackBarAction(label: 'Rückgängig', onPressed: onUndo)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(duration: duration, content: Text(text), action: SnackBarAction(label: 'Rückgängig', onPressed: onUndo)));
   }
 
 
@@ -1841,7 +2233,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           Image.asset('assets/icon/coachsplit_icon.png', width: 38, height: 38),
           const SizedBox(width: 10),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('CoachSplit 1.0.1 RC1'),
+            const Text('CoachSplit 1.0.3 RC3'),
             Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
           ])),
         ]),
@@ -1849,9 +2241,13 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       body: SafeArea(
         child: Column(children: [
           _Stats(event: event),
-          _Nav(selected: _page, onChanged: (i) {
+          _Nav(selected: _page, setupLocked: event?.status == CompetitionStatus.running, onChanged: (i) {
             if (i > 0 && !_setupReady) {
               _show('Bitte zuerst im Setup auf "Zum Start" tippen.');
+              return;
+            }
+            if (i == 0 && event?.status == CompetitionStatus.running) {
+              _show('Der Bewerb läuft. Änderungen erfolgen direkt unter Erfassen.');
               return;
             }
             setState(() => _page = i);
@@ -1933,6 +2329,22 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
             label: const Text('Startzeiten übernehmen'),
           ),
           SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Altersklassen getrennt werten'), subtitle: const Text('Auch in Ergebnisansicht umschaltbar'), value: _compareByCategory, onChanged: (v) { setState(() => _compareByCategory = v); _scheduleSetupAutosave(); }),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Zeitstrafe pro Schießfehler'),
+            subtitle: const Text('Wird nur auf die offizielle Zielzeit aufgeschlagen.'),
+            value: _timePenaltyEnabled,
+            onChanged: (value) { setState(() => _timePenaltyEnabled = value); _scheduleSetupAutosave(); },
+          ),
+          if (_timePenaltyEnabled)
+            DropdownButtonFormField<int>(
+              value: _penaltySecondsPerMiss,
+              decoration: const InputDecoration(labelText: 'Sekunden pro Fehler'),
+              items: const [15, 20, 30, 45, 60].map((value) => DropdownMenuItem(value: value, child: Text('$value Sekunden'))).toList(),
+              onChanged: (value) { if (value != null) { setState(() => _penaltySecondsPerMiss = value); _scheduleSetupAutosave(); } },
+            ),
+          const SizedBox(height: 8),
+          _competitionClockCard(),
           TextField(controller: _athletesText, maxLines: 8, onChanged: (_) => _scheduleSetupAutosave(), decoration: const InputDecoration(labelText: 'Athleten im Bewerb', hintText: '12, Max, U12m, *', alignLabelWithHint: true)),
           const SizedBox(height: 8),
           Wrap(spacing: 8, runSpacing: 8, children: [
@@ -1940,7 +2352,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
             OutlinedButton.icon(onPressed: _addSplitPointFromSetup, icon: const Icon(Icons.add_location_alt), label: const Text('Messpunkt hinzufügen')),
           ]),
           const SizedBox(height: 8),
-          TextField(controller: _pointsText, maxLines: 5, onChanged: (_) => _scheduleSetupAutosave(), decoration: const InputDecoration(labelText: 'Messpunkte', hintText: 'Messpunkt 1, split\nMesspunkt 2, split\nZiel, ziel', alignLabelWithHint: true)),
+          TextField(controller: _pointsText, maxLines: 5, onChanged: (_) => _scheduleSetupAutosave(), decoration: const InputDecoration(labelText: 'Messpunkte', hintText: 'Zwischenzeit 1, split\nZiel, ziel', alignLabelWithHint: true)),
           const SizedBox(height: 12),
           const SizedBox(height: 8),
           FilledButton.icon(onPressed: _goToStart, icon: const Icon(Icons.arrow_forward), label: const Text('Zum Start')),
@@ -1995,7 +2407,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       ])),
       _Section(title: 'Unterwegs', subtitle: 'letzter bekannter Stand', child: Column(children: [
         if (running.isEmpty) const ListTile(title: Text('Noch niemand unterwegs')),
-        for (final athlete in running) ListTile(leading: _Bib(bib: athlete.bib), title: Text(athlete.name.toUpperCase()), subtitle: Text('${athlete.category} · ${_lastStand(athlete)}'), trailing: const Text('läuft')),
+        for (final athlete in running) ListTile(leading: _Bib(bib: athlete.bib), title: Text(athlete.name.toUpperCase()), subtitle: Text('${athlete.category} · ${_lastStand(athlete)}'), trailing: PopupMenuButton<String>(onSelected: (value) { if (value == 'dnf') _markDnf(athlete); }, itemBuilder: (_) => const [PopupMenuItem(value: 'dnf', child: Text('Als DNF markieren'))])),
       ])),
       _Section(title: 'Zuletzt im Ziel', subtitle: 'Laufzeit · Platz · Rückstand', child: Column(children: [
         if (finished.isEmpty) const ListTile(title: Text('Noch keine Zielzeit')),
@@ -2010,14 +2422,14 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return ListView(padding: const EdgeInsets.all(12), children: [
       Padding(
         padding: const EdgeInsets.only(bottom: 8),
-        child: OutlinedButton.icon(
-          onPressed: _addSplitPointFromCapture,
-          icon: const Icon(Icons.add_location_alt),
-          label: const Text('Messpunkt hinzufügen'),
-        ),
+        child: Wrap(spacing: 8, runSpacing: 8, children: [
+          OutlinedButton.icon(onPressed: _addSplitPointFromCapture, icon: const Icon(Icons.add_location_alt), label: const Text('Messpunkt hinzufügen')),
+          OutlinedButton.icon(onPressed: _changePenaltyDuringRace, icon: const Icon(Icons.timer_outlined), label: const Text('Strafzeit')),
+        ]),
       ),
       for (final point in event.points)
-        _Section(title: point.name, subtitle: point.type == PointType.finish ? 'Ziel · Prognose lernt nach ersten Durchgängen' : 'Messpunkt · Prognose lernt nach ersten Durchgängen', child: Column(children: [
+        _Section(title: point.name, subtitle: point.trainerNote?.isNotEmpty == true ? point.trainerNote! : point.type == PointType.finish ? 'Ziel · offizielle Zeit inklusive aktiver Zeitstrafen' : point.type == PointType.shootingExit ? 'Schießstand aus · L/S und 0–5 Fehler erfassen' : 'Messpunkt · Prognose lernt nach ersten Durchgängen', child: Column(children: [
+          Align(alignment: Alignment.centerRight, child: IconButton(tooltip: 'Bezeichnung und Hinweis bearbeiten', onPressed: () => _editPointDuringRace(point), icon: const Icon(Icons.edit_note))),
           if (_candidatesFor(point).isEmpty) const ListTile(title: Text('Keine Athleten erwartet')),
           for (final c in _candidatesFor(point)) _CaptureRow(candidate: c, etaText: _eta(c.predictedTime), liveGapText: _liveGapText(c.athlete, point), onTap: () => _capture(c.athlete, point)),
         ])),
@@ -2066,12 +2478,14 @@ class _Stats extends StatelessWidget {
     final waiting = athletes.where((a) => a.status == AthleteStatus.waiting).length;
     final running = athletes.where((a) => a.status == AthleteStatus.running).length;
     final finished = athletes.where((a) => a.status == AthleteStatus.finished).length;
+    final dnf = athletes.where((a) => a.status == AthleteStatus.didNotFinish).length;
     return Padding(padding: const EdgeInsets.fromLTRB(12, 8, 12, 4), child: Row(children: [
       Expanded(child: _Stat(label: 'warten', value: '$waiting')),
       const SizedBox(width: 8),
       Expanded(child: _Stat(label: 'unterwegs', value: '$running')),
       const SizedBox(width: 8),
       Expanded(child: _Stat(label: 'fertig', value: '$finished')),
+      if (dnf > 0) ...[const SizedBox(width: 8), Expanded(child: _Stat(label: 'DNF', value: '$dnf'))],
     ]));
   }
 }
@@ -2143,9 +2557,10 @@ class CoachSplitLogo extends StatelessWidget {
 }
 
 class _Nav extends StatelessWidget {
-  const _Nav({required this.selected, required this.onChanged});
+  const _Nav({required this.selected, required this.onChanged, this.setupLocked = false});
   final int selected;
   final ValueChanged<int> onChanged;
+  final bool setupLocked;
 
   String _formatClock(DateTime time) {
     final h = time.hour.toString().padLeft(2, '0');
@@ -2157,7 +2572,7 @@ class _Nav extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = const [(Icons.settings, 'Setup'), (Icons.play_arrow, 'Start'), (Icons.touch_app, 'Erfassen'), (Icons.leaderboard, 'Ergebnis')];
-    return Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4), child: SegmentedButton<int>(segments: [for (var i = 0; i < items.length; i++) ButtonSegment(value: i, icon: Icon(items[i].$1, size: 18), label: Text(items[i].$2))], selected: {selected}, onSelectionChanged: (s) => onChanged(s.first)));
+    return Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4), child: SegmentedButton<int>(segments: [for (var i = 0; i < items.length; i++) ButtonSegment(value: i, enabled: !(setupLocked && i == 0), icon: Icon(items[i].$1, size: 18), label: Text(items[i].$2))], selected: {selected}, onSelectionChanged: (s) => onChanged(s.first)));
   }
 }
 

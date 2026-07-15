@@ -69,3 +69,10 @@ Dann den kompletten Ordner `build/web` bei Netlify hochladen.
 ## Hinweis
 
 Eine PWA ersetzt auf iOS/Android nicht in allen Punkten eine native App. Für echte Wettkampfnutzung am Streckenrand bleibt die APK/native App weiterhin die robustere Variante.
+
+## Biathlon- und Architekturarbeitsstand
+
+Der aktuelle Arbeitsstand ergänzt die direkte Messpunktauswahl, gekoppelte Schießstände, Schießerfassung, optionale Zeitstrafen und eine kalibrierbare Wettkampfuhr. Die Architekturentscheidung für die nächste Stufe ist cloud-first mit lokaler Offline-Warteschlange. Details stehen in `ARCHITECTURE_NEXT_STEPS.md`.
+
+## 1.0.3 RC2 – sichere Änderungen im laufenden Bewerb
+Nach „Zum Start“ wird das Setup nicht mehr erneut auf den laufenden Bewerb angewendet. Bezeichnungen und Standorthinweise werden direkt in der Erfassungsansicht gepflegt. Neue Messpunkte bleiben während des Rennens möglich; bereits verwendete Messpunkte sind strukturell geschützt. DNF und eine gewarnte, rückwirkende Anpassung der Strafzeit sind enthalten. Die neue Repository- und RaceEvent-Schnittstelle bereitet Firebase, Offline-Synchronisation und Multiuser vor.

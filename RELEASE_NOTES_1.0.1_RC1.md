@@ -17,3 +17,13 @@ Bewusst unverändert:
 - Ranking- und Ergebnisberechnung
 - Prognoselogik
 - Archivdaten
+
+## Architektur-/Biathlon-Erweiterung (technischer Arbeitsstand)
+
+- Messpunktwahl ohne Dropdown: Zwischenzeit, Schießstand oder freier Messpunkt direkt anwählbar.
+- Start und Ziel bleiben verpflichtend; neue Punkte werden vor dem Ziel eingefügt.
+- Ein Schießstand erzeugt automatisch Ein- und Ausgang mit gemeinsamer Nummer.
+- Bei Schießstand aus werden L/S und 0–5 Fehler erfasst.
+- Optionale Zeitstrafe pro Schießfehler; Rohzeit bleibt unverändert, Zielwertung berücksichtigt die Strafzeit.
+- Kalibrierbare offizielle Wettkampfuhr mit Fallback auf Administratorzeit.
+- Persistierte Schema-Version und rückwärtskompatible JSON-Felder als Vorbereitung für Datenbankmigration.
