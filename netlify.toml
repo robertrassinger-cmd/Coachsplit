@@ -1,11 +1,5 @@
 [build]
-  command = '''
-    git clone https://github.com/flutter/flutter.git --depth 1 -b stable /opt/buildhome/flutter &&
-    export PATH="$PATH:/opt/buildhome/flutter/bin" &&
-    flutter config --no-analytics &&
-    flutter pub get &&
-    flutter build web --release --no-wasm-dry-run
-  '''
+  command = "flutter config --no-analytics && flutter pub get && flutter build web --release --no-wasm-dry-run"
   publish = "build/web"
 
 [[redirects]]
