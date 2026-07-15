@@ -1,4 +1,4 @@
-part of '../main.dart';
+part of coachsplit;
 
 class CoachSplitApp extends StatelessWidget {
   const CoachSplitApp({super.key});
@@ -29,3 +29,4 @@ class CoachSplitApp extends StatelessWidget {
     );
   }
 }
+

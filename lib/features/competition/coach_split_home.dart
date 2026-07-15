@@ -1,4 +1,4 @@
-part of '../main.dart';
+part of coachsplit;
 
 class CoachSplitHome extends StatefulWidget {
   const CoachSplitHome({super.key});
@@ -1992,7 +1992,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           Image.asset('assets/icon/coachsplit_icon.png', width: 38, height: 38),
           const SizedBox(width: 10),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('CoachSplit 1.0.4 RC1'),
+            const Text('CoachSplit 1.0.4 RC2'),
             Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
           ])),
         ]),
@@ -2219,3 +2219,4 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     ]);
   }
 }
+

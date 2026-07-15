@@ -1,5 +1,19 @@
 [build]
-  command = "flutter config --no-analytics && flutter pub get && flutter build web --release --no-wasm-dry-run"
+  command = '''
+    if command -v flutter >/dev/null 2>&1; then
+      echo "Using Flutter from PATH";
+    elif [ -x /opt/buildhome/flutter/bin/flutter ]; then
+      echo "Using existing Flutter SDK";
+      export PATH="/opt/buildhome/flutter/bin:$PATH";
+    else
+      echo "Installing pinned Flutter SDK 3.44.6";
+      git clone https://github.com/flutter/flutter.git --depth 1 --branch 3.44.6 /opt/buildhome/flutter;
+      export PATH="/opt/buildhome/flutter/bin:$PATH";
+    fi &&
+    flutter config --no-analytics &&
+    flutter pub get &&
+    flutter build web --release --no-wasm-dry-run
+  '''
   publish = "build/web"
 
 [[redirects]]

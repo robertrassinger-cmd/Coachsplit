@@ -1,4 +1,4 @@
-# CoachSplit 1.0.4 RC1
+# CoachSplit 1.0.4 RC2
 
 Professioneller Konsolidierungsstand auf Basis der zuletzt bestätigten, funktionierenden Version 1.0.2.
 

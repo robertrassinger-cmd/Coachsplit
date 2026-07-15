@@ -1,3 +1,5 @@
+library coachsplit;
+
 
 import 'dart:async';
 import 'dart:convert';
@@ -16,9 +18,10 @@ import 'package:share_plus/share_plus.dart';
 import 'web_download_stub.dart' if (dart.library.html) 'web_download_web.dart';
 import 'services/competition_clock.dart';
 
-part 'app/coachsplit_app.dart';
+
+part 'app/coach_split_app.dart';
 part 'domain/models.dart';
-part 'presentation/coachsplit_home.dart';
-part 'presentation/widgets.dart';
+part 'features/competition/coach_split_home.dart';
+part 'ui/widgets.dart';
 
 void main() => runApp(const CoachSplitApp());

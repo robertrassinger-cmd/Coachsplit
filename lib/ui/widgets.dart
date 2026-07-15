@@ -1,4 +1,4 @@
-part of '../main.dart';
+part of coachsplit;
 
 class _Stats extends StatelessWidget {
   const _Stats({required this.event});

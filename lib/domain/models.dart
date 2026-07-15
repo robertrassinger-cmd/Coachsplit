@@ -1,4 +1,4 @@
-part of '../main.dart';
+part of coachsplit;
 
 enum PointType { split, shootingEntry, shootingExit, finish }
 enum AthleteStatus { waiting, running, finished, didNotFinish }
@@ -192,3 +192,4 @@ class Candidate {
   DateTime? predictedTime;
   String quality;
 }
+
