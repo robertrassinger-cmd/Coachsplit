@@ -3,7 +3,7 @@
   "short_name": "CoachSplit",
   "description": "CoachSplit - mobile Zeitmessung und Analyse für Trainer.",
   "lang": "de-AT",
-  "start_url": "/?v=103rc3",
+  "start_url": "/?v=104rc1",
   "scope": "/",
   "display": "standalone",
   "display_override": [
@@ -21,29 +21,29 @@
   "prefer_related_applications": false,
   "icons": [
     {
-      "src": "icons/Icon-192.png?v=103rc3",
+      "src": "icons/Icon-192.png?v=104rc1",
       "sizes": "192x192",
       "type": "image/png"
     },
     {
-      "src": "icons/Icon-512.png?v=103rc3",
+      "src": "icons/Icon-512.png?v=104rc1",
       "sizes": "512x512",
       "type": "image/png"
     },
     {
-      "src": "icons/Icon-maskable-192.png?v=103rc3",
+      "src": "icons/Icon-maskable-192.png?v=104rc1",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "maskable"
     },
     {
-      "src": "icons/Icon-maskable-512.png?v=103rc3",
+      "src": "icons/Icon-maskable-512.png?v=104rc1",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"
     },
     {
-      "src": "icons/apple-touch-icon.png?v=103rc3",
+      "src": "icons/apple-touch-icon.png?v=104rc1",
       "sizes": "180x180",
       "type": "image/png"
     }

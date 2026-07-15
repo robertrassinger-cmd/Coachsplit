@@ -2233,7 +2233,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           Image.asset('assets/icon/coachsplit_icon.png', width: 38, height: 38),
           const SizedBox(width: 10),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('CoachSplit 1.0.3 RC3'),
+            const Text('CoachSplit 1.0.4 RC1'),
             Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
           ])),
         ]),
