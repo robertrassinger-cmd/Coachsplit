@@ -153,16 +153,18 @@ class _StartRow extends StatelessWidget {
   const _StartRow({
     required this.athlete,
     required this.autoStartEnabled,
+    required this.currentCompetitionTime,
     required this.onStart,
   });
 
   final Athlete athlete;
   final bool autoStartEnabled;
+  final DateTime currentCompetitionTime;
   final VoidCallback onStart;
 
   @override
   Widget build(BuildContext context) {
-    final diff = athlete.scheduledStart.difference(DateTime.now());
+    final diff = athlete.scheduledStart.difference(currentCompetitionTime);
     final late = diff.isNegative;
 
     return Card(
@@ -278,28 +280,129 @@ class _CaptureRow extends StatelessWidget {
 }
 
 class _Results extends StatelessWidget {
-  const _Results({required this.point, required this.rows, required this.compareByCategory, required this.fmt});
+  const _Results({
+    required this.point,
+    required this.rows,
+    required this.compareByCategory,
+    required this.fmt,
+    required this.shootingResultFor,
+  });
+
   final SplitPoint point;
   final List<RankRow> rows;
   final bool compareByCategory;
   final String Function(Duration) fmt;
+  final ShootingResult? Function(Athlete athlete) shootingResultFor;
 
-  String _formatClock(DateTime time) {
-    final h = time.hour.toString().padLeft(2, '0');
-    final m = time.minute.toString().padLeft(2, '0');
-    final s = time.second.toString().padLeft(2, '0');
-    return '$h:$m:$s';
+  String get _pointTitle {
+    if (point.type != PointType.shootingExit) return point.name;
+    final position = point.shootingPosition == ShootingPosition.standing
+        ? 'stehend'
+        : 'liegend';
+    return '${point.name} ($position)';
   }
 
   @override
   Widget build(BuildContext context) {
-    if (rows.isEmpty) return const Center(child: Text('Noch keine Zeiten erfasst'));
+    if (rows.isEmpty) {
+      return const Center(child: Text('Noch keine Zeiten erfasst'));
+    }
+
     final groups = <String, List<RankRow>>{};
     for (final row in rows) {
       final key = compareByCategory ? row.athlete.category : 'ALLE';
       groups.putIfAbsent(key, () => []).add(row);
     }
-    return ListView(padding: const EdgeInsets.all(12), children: [for (final entry in groups.entries) _Section(title: entry.key, subtitle: point.type == PointType.finish ? 'Zielwertung' : 'Gesamtzeit + letzter Abschnitt', child: Column(children: [for (final row in entry.value) ListTile(leading: _Bib(bib: row.athlete.bib), title: Text(row.athlete.name), subtitle: Text(point.type == PointType.finish ? '${row.athlete.category} · Zeit ${fmt(row.elapsed)}' : '${row.athlete.category} · Gesamt ${fmt(row.elapsed)} · Abschnitt ${row.sectionElapsed == null ? '—' : '${fmt(row.sectionElapsed!)} (${row.sectionPlace ?? row.place})'}'), trailing: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [Text('Pl ${row.place}'), Text('+${fmt(row.deltaToLeader)}')]))]))]);
+
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        if (point.type == PointType.shootingExit)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(
+              _pointTitle,
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+            ),
+          ),
+        for (final entry in groups.entries)
+          _Section(
+            title: entry.key,
+            subtitle: point.type == PointType.finish
+                ? 'Zielwertung'
+                : point.type == PointType.shootingExit
+                    ? 'Gewertete Zeit inklusive Schießfehler'
+                    : 'Gesamtzeit + letzter Abschnitt',
+            child: Column(
+              children: [
+                for (final row in entry.value)
+                  ListTile(
+                    leading: _Bib(bib: row.athlete.bib),
+                    title: Text(row.athlete.name),
+                    subtitle: Text(
+                      point.type == PointType.finish
+                          ? '${row.athlete.category} · Zeit ${fmt(row.elapsed)}'
+                          : '${row.athlete.category} · Gesamt ${fmt(row.elapsed)}'
+                              ' · Abschnitt ${row.sectionElapsed == null ? '—' : '${fmt(row.sectionElapsed!)} (${row.sectionPlace ?? row.place})'}',
+                    ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (point.type == PointType.shootingExit) ...[
+                          _MissBadge(
+                            misses: shootingResultFor(row.athlete)?.misses,
+                          ),
+                          const SizedBox(width: 12),
+                        ],
+                        Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text('Pl ${row.place}'),
+                            Text(
+                              row.deltaToLeader == Duration.zero
+                                  ? 'führend'
+                                  : '+${fmt(row.deltaToLeader)}',
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _MissBadge extends StatelessWidget {
+  const _MissBadge({required this.misses});
+  final int? misses;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 34,
+      height: 34,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.black, width: 1.5),
+      ),
+      child: Text(
+        misses == null ? '–' : '$misses',
+        style: const TextStyle(
+          color: Colors.black,
+          fontWeight: FontWeight.w900,
+          fontSize: 16,
+        ),
+      ),
+    );
   }
 }
 

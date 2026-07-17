@@ -12,6 +12,7 @@
     fi &&
     flutter config --no-analytics &&
     flutter pub get &&
+    flutter test &&
     flutter build web --release --no-wasm-dry-run
   '''
   publish = "build/web"

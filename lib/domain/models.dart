@@ -21,6 +21,8 @@ class ShootingResult {
 
 class Athlete {
   Athlete({
+    String? id,
+    String? participationId,
     required this.bib,
     required this.name,
     required this.category,
@@ -30,9 +32,13 @@ class Athlete {
     this.status = AthleteStatus.waiting,
     Map<String, DateTime>? captures,
     Map<String, ShootingResult>? shootingResults,
-  })  : captures = captures ?? {},
+  })  : id = id ?? const Uuid().v7(),
+        participationId = participationId ?? const Uuid().v7(),
+        captures = captures ?? {},
         shootingResults = shootingResults ?? {};
 
+  String id;
+  String participationId;
   int bib;
   String name;
   String category;
@@ -46,6 +52,8 @@ class Athlete {
   DateTime get startTime => actualStart ?? scheduledStart;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
+        'participationId': participationId,
         'bib': bib,
         'name': name,
         'category': category,
@@ -58,6 +66,8 @@ class Athlete {
       };
 
   static Athlete fromJson(Map<String, dynamic> json) => Athlete(
+        id: json['id'] as String?,
+        participationId: json['participationId'] as String?,
         bib: (json['bib'] as num).toInt(),
         name: json['name'] as String,
         category: json['category'] as String,
@@ -73,12 +83,20 @@ class Athlete {
 }
 
 class SplitPoint {
-  SplitPoint({required this.id, required this.name, required this.type, this.shootingRangeNumber, this.trainerNote});
+  SplitPoint({
+    required this.id,
+    required this.name,
+    required this.type,
+    this.shootingRangeNumber,
+    this.shootingPosition,
+    this.trainerNote,
+  });
 
   String id;
   String name;
   PointType type;
   int? shootingRangeNumber;
+  ShootingPosition? shootingPosition;
   String? trainerNote;
 
   bool get requiresShootingData => type == PointType.shootingExit;
@@ -88,6 +106,7 @@ class SplitPoint {
         'name': name,
         'type': type.name,
         'shootingRangeNumber': shootingRangeNumber,
+        'shootingPosition': shootingPosition?.name,
         'trainerNote': trainerNote,
       };
 
@@ -98,6 +117,12 @@ class SplitPoint {
       name: json['name'] as String,
       type: PointType.values.firstWhere((type) => type.name == rawType, orElse: () => rawType == 'finish' ? PointType.finish : PointType.split),
       shootingRangeNumber: (json['shootingRangeNumber'] as num?)?.toInt(),
+      shootingPosition: json['shootingPosition'] == null
+          ? null
+          : ShootingPosition.values.firstWhere(
+              (value) => value.name == json['shootingPosition'],
+              orElse: () => ShootingPosition.prone,
+            ),
       trainerNote: json['trainerNote'] as String?,
     );
   }
@@ -105,6 +130,7 @@ class SplitPoint {
 
 class RaceEvent {
   RaceEvent({
+    String? id,
     required this.name,
     required this.firstStart,
     required this.intervalSeconds,
@@ -115,9 +141,10 @@ class RaceEvent {
     this.penaltySecondsPerMiss = 0,
     this.clockCalibration,
     this.status = CompetitionStatus.draft,
-    this.schemaVersion = 3,
-  });
+    this.schemaVersion = 4,
+  }) : id = id ?? const Uuid().v7();
 
+  String id;
   String name;
   DateTime firstStart;
   int intervalSeconds;
@@ -131,6 +158,7 @@ class RaceEvent {
   int schemaVersion;
 
   Map<String, dynamic> toJson() => {
+        'id': id,
         'schemaVersion': schemaVersion,
         'name': name,
         'firstStart': firstStart.toIso8601String(),
@@ -145,6 +173,7 @@ class RaceEvent {
       };
 
   static RaceEvent fromJson(Map<String, dynamic> json) => RaceEvent(
+        id: json['id'] as String?,
         name: json['name'] as String,
         firstStart: DateTime.parse(json['firstStart'] as String),
         intervalSeconds: (json['intervalSeconds'] as num).toInt(),

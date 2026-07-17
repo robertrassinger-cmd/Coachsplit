@@ -1,0 +1,105 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function session(sessionId) {
+      return get(/databases/$(database)/documents/competitionSessions/$(sessionId));
+    }
+
+    function isOwner(sessionId) {
+      return signedIn() && session(sessionId).data.ownerUid == request.auth.uid;
+    }
+
+    function device(sessionId, deviceId) {
+      return get(/databases/$(database)/documents/competitionSessions/$(sessionId)/devices/$(deviceId));
+    }
+
+    function isMember(sessionId) {
+      return signedIn() && exists(
+        /databases/$(database)/documents/competitionSessions/$(sessionId)/members/$(request.auth.uid)
+      );
+    }
+
+    // A join code contains no timing data. It only resolves a short-lived code
+    // to an open session. Creation and changes remain owner-only.
+    match /joinCodes/{joinToken} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow update, delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+    }
+
+    match /competitionSessions/{sessionId} {
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid;
+      allow read, update, delete: if isOwner(sessionId);
+
+
+      match /members/{uid} {
+        allow read: if isOwner(sessionId) || (signedIn() && uid == request.auth.uid);
+        allow create: if signedIn()
+          && uid == request.auth.uid
+          && request.resource.data.firebaseUid == request.auth.uid
+          && session(sessionId).data.status == 'openForJoining';
+        allow update, delete: if isOwner(sessionId);
+      }
+
+      match /competition/{documentId} {
+        allow read: if isOwner(sessionId) || isMember(sessionId);
+        allow write: if isOwner(sessionId);
+      }
+
+      match /checkpoints/{checkpointId} {
+        allow read: if isOwner(sessionId) || isMember(sessionId);
+        allow write: if isOwner(sessionId);
+      }
+
+      match /devices/{deviceId} {
+        allow read: if isOwner(sessionId)
+          || (signedIn() && resource.data.firebaseUid == request.auth.uid);
+
+        allow create: if signedIn()
+          && request.resource.data.firebaseUid == request.auth.uid
+          && request.resource.data.deviceId == deviceId
+          && session(sessionId).data.status == 'openForJoining';
+
+        // A helper may update presence only; checkpoint assignment remains an
+        // administrator operation.
+        allow update: if isOwner(sessionId)
+          || (signedIn()
+            && resource.data.firebaseUid == request.auth.uid
+            && request.resource.data.firebaseUid == resource.data.firebaseUid
+            && request.resource.data.deviceId == resource.data.deviceId
+            && request.resource.data.get('checkpointId', null) == resource.data.get('checkpointId', null)
+            && request.resource.data.get('checkpointName', null) == resource.data.get('checkpointName', null)
+            && request.resource.data.assignmentRevision == resource.data.assignmentRevision
+            && request.resource.data.role == resource.data.role);
+        allow delete: if isOwner(sessionId);
+      }
+
+      match /timingEvents/{eventId} {
+        allow read: if isOwner(sessionId) || isMember(sessionId);
+        allow create: if signedIn()
+          && request.resource.data.id == eventId
+          && request.resource.data.sessionId == sessionId
+          && request.resource.data.deviceId is string
+          && device(sessionId, request.resource.data.deviceId).data.firebaseUid == request.auth.uid
+          && (
+            isOwner(sessionId)
+            || device(sessionId, request.resource.data.deviceId).data.checkpointId
+              == request.resource.data.measurementPointId
+          );
+        allow update, delete: if false;
+      }
+
+      match /conflictGroups/{conflictId} {
+        allow read: if isOwner(sessionId) || isMember(sessionId);
+        allow create, update: if isOwner(sessionId);
+        allow delete: if false;
+      }
+    }
+  }
+}

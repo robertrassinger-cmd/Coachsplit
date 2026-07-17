@@ -1,0 +1,7 @@
+{
+  "name": "coachsplit-sync-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {"start": "node server.js", "check": "node --check server.js", "smoke": "node smoke-test.js"},
+  "engines": {"node": ">=20"}
+}

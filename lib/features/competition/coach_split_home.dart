@@ -22,6 +22,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   String? _currentEventKey;
   bool _setupReady = false;
   bool _viewingArchivedEvent = false;
+  bool _storageReady = false;
+  String? _storageFailure;
+  Future<void> _storageWriteChain = Future<void>.value();
   Timer? _setupAutosaveTimer;
   RaceEvent? _event;
 
@@ -32,6 +35,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   bool _timePenaltyEnabled = false;
   int _penaltySecondsPerMiss = 30;
   final CompetitionClock _competitionClock = CompetitionClock();
+  final PenaltyService _penaltyService = const PenaltyService();
+  final RankingService _rankingService = const RankingService();
+  final ShootingRangeNumberService _shootingRangeNumberService = const ShootingRangeNumberService();
+  final TimingEventRepository _timingEventRepository = SembastTimingEventRepository();
+  final CompetitionRepository _competitionRepository =
+      SembastCompetitionRepository();
+  CaptureTimingEventService? _captureTimingEventService;
+
+  final _helperDisplayName = TextEditingController();
+  final MultiuserApiClient _multiuserApi = MultiuserApiClient();
+  MultiuserConnection? _multiuserConnection;
+  CollaborationState? _collaborationState;
+  String? _joinUrl;
+  SyncEngine? _syncEngine;
+  Timer? _syncTimer;
+  bool _syncBusy = false;
+  String _syncMessage = 'Nicht verbunden';
+  int _lastPushed = 0;
+  int _lastReceived = 0;
+  int _lastConflicts = 0;
   TimeOfDay _firstStartTime = TimeOfDay.fromDateTime(DateTime.now().add(const Duration(minutes: 2)));
 
   Timer? _timer;
@@ -71,8 +94,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   @override
   void initState() {
     super.initState();
-    _loadStorage();
-    _createEventFromSetup(silent: true);
+    _initializeStorage();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       _autoStart();
       if (mounted) setState(() {});
@@ -82,7 +104,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   @override
   void dispose() {
     _timer?.cancel();
+    _syncTimer?.cancel();
     _setupAutosaveTimer?.cancel();
+    _helperDisplayName.dispose();
     _eventName.dispose();
     _athletesText.dispose();
     _pointsText.dispose();
@@ -90,43 +114,652 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     super.dispose();
   }
 
+
+  Future<void> _initializeStorage() async {
+    await _loadStorage();
+    await _restoreMultiuserConnection();
+    await _handleJoinLink();
+    if (!mounted) return;
+    if (_storageFailure == null && _event == null && _savedEvents.isEmpty) {
+      _createEventFromSetup(silent: true);
+    }
+    setState(() => _storageReady = true);
+  }
+
+  Future<String> _deviceId() async {
+    final service = await _timingService();
+    return service.deviceId;
+  }
+
+  Future<void> _restoreMultiuserConnection() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('coachsplit_multiuser_connection');
+    _joinUrl = prefs.getString('coachsplit_multiuser_join_url');
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final connection = MultiuserConnection.fromJson(
+        Map<String, Object?>.from(jsonDecode(raw) as Map),
+      );
+      await _activateMultiuserConnection(connection, persist: false);
+    } catch (_) {
+      await prefs.remove('coachsplit_multiuser_connection');
+      await prefs.remove('coachsplit_multiuser_join_url');
+    }
+  }
+
+  Future<void> _activateMultiuserConnection(
+    MultiuserConnection connection, {
+    bool persist = true,
+  }) async {
+    _syncTimer?.cancel();
+    final transport = FirestoreSyncTransport(
+      sessionId: connection.sessionId,
+    );
+    _multiuserConnection = connection;
+    _syncEngine = SyncEngine(
+      repository: _timingEventRepository,
+      transport: transport,
+      deviceId: await _deviceId(),
+      sessionId: connection.sessionId,
+    );
+    if (persist) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        'coachsplit_multiuser_connection',
+        jsonEncode(connection.toJson()),
+      );
+    }
+    _syncTimer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _runMultiuserSync(silent: true),
+    );
+    if (mounted) {
+      setState(() {
+        _syncMessage = connection.isAdministrator
+            ? 'Als Administrator verbunden'
+            : 'Messpunkt ${connection.checkpointName ?? connection.checkpointId} verbunden';
+      });
+    }
+    await _runMultiuserSync(silent: true);
+  }
+
+
+  String get _appBaseUrl {
+    final uri = Uri.base;
+    return uri.replace(query: '', fragment: '').toString().replaceFirst(RegExp(r'/$'), '');
+  }
+
+  Future<void> _handleJoinLink() async {
+    if (_multiuserConnection != null) return;
+    final joinToken = Uri.base.queryParameters['join'];
+    if (joinToken == null || joinToken.isEmpty) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _showJoinDialog(joinToken));
+  }
+
+  Future<String?> _askHelperName() async {
+    _helperDisplayName.text = _helperDisplayName.text.trim().isEmpty
+        ? 'Helfer'
+        : _helperDisplayName.text.trim();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Bei Bewerb anmelden'),
+        content: TextField(
+          controller: _helperDisplayName,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Name',
+            hintText: 'z. B. Anna',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Abbrechen'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final value = _helperDisplayName.text.trim();
+              if (value.isNotEmpty) Navigator.pop(context, value);
+            },
+            child: const Text('Verbinden'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showJoinDialog(String joinToken) async {
+    final name = await _askHelperName();
+    if (name == null || !mounted) return;
+    await _joinMultiuserSession(joinToken: joinToken, displayName: name);
+  }
+
+  Future<void> _createMultiuserSession() async {
+    final event = _event;
+    if (event == null) {
+      _show('Bitte zuerst einen Bewerb anlegen.');
+      return;
+    }
+    setState(() => _syncBusy = true);
+    try {
+      final deviceId = await _deviceId();
+      final created = await _multiuserApi.createSession(
+        serverUrl: 'firebase://coachsplit',
+        appBaseUrl: _appBaseUrl,
+        deviceId: deviceId,
+        deviceName: 'Administrator',
+        competition: event.toJson(),
+        checkpoints: event.points
+            .map((point) => <String, Object?>{
+                  'id': point.id,
+                  'name': point.name,
+                  'kind': _timingKind(point).name,
+                })
+            .toList(),
+      );
+      _joinUrl = created.joinUrl;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('coachsplit_multiuser_join_url', created.joinUrl);
+      await _activateMultiuserConnection(created.connection);
+      await _refreshCollaborationState();
+      if (!mounted) return;
+      await _showControlCenter();
+    } catch (error) {
+      _show('Helferverbindung konnte nicht gestartet werden: $error');
+    } finally {
+      if (mounted) setState(() => _syncBusy = false);
+    }
+  }
+
+  Future<void> _joinMultiuserSession({
+    required String joinToken,
+    required String displayName,
+  }) async {
+    setState(() => _syncBusy = true);
+    try {
+      final joined = await _multiuserApi.join(
+        serverUrl: 'firebase://coachsplit',
+        joinToken: joinToken,
+        deviceId: await _deviceId(),
+        displayName: displayName,
+      );
+      final event = RaceEvent.fromJson(Map<String, dynamic>.from(joined.competition));
+      await _competitionRepository.saveActive(event);
+      _savedEvents[event.name] = event;
+      _event = event;
+      _currentEventKey = event.name;
+      _setupReady = true;
+      await _restoreTimingFromRepository(event);
+      await _activateMultiuserConnection(joined.connection);
+      if (mounted) {
+        setState(() => _page = 2);
+        _show(joined.connection.isAssigned
+            ? 'Messpunkt ${joined.connection.checkpointName} wurde zugewiesen.'
+            : 'Verbunden. Bitte auf Zuweisung warten.');
+      }
+    } catch (error) {
+      _show('Beitritt fehlgeschlagen: $error');
+    } finally {
+      if (mounted) setState(() => _syncBusy = false);
+    }
+  }
+
+  Future<void> _refreshCollaborationState() async {
+    final connection = _multiuserConnection;
+    if (connection == null || !connection.isAdministrator) return;
+    final state = await _multiuserApi.fetchState(connection);
+    if (mounted) setState(() => _collaborationState = state);
+  }
+
+  Future<void> _assignDevice(String deviceId, String? checkpointId) async {
+    final connection = _multiuserConnection;
+    if (connection == null || !connection.isAdministrator) return;
+    await _multiuserApi.assignDevice(
+      connection: connection,
+      deviceId: deviceId,
+      checkpointId: checkpointId,
+    );
+    await _refreshCollaborationState();
+  }
+
+  Future<void> _showControlCenter() async {
+    final event = _event;
+    if (event == null || _multiuserConnection?.isAdministrator != true) return;
+    await _refreshCollaborationState();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          Future<void> refresh() async {
+            await _refreshCollaborationState();
+            if (dialogContext.mounted) setDialogState(() {});
+          }
+          final devices = _collaborationState?.devices ?? const <ConnectedHelperDevice>[];
+          return AlertDialog(
+            title: const Text('Leitstelle'),
+            content: SizedBox(
+              width: 760,
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (_joinUrl != null) ...[
+                      const Text('Ein QR-Code für alle Helfer'),
+                      const SizedBox(height: 8),
+                      Center(
+                        child: QrImageView(
+                          data: _joinUrl!,
+                          size: 210,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      SelectableText(_joinUrl!, textAlign: TextAlign.center),
+                      const Divider(height: 28),
+                    ],
+                    Text('Verbundene Helfer (${devices.length})',
+                        style: Theme.of(context).textTheme.titleMedium),
+                    const SizedBox(height: 8),
+                    if (devices.isEmpty)
+                      const ListTile(
+                        leading: Icon(Icons.hourglass_empty),
+                        title: Text('Noch kein Helfer verbunden'),
+                        subtitle: Text('QR-Code mit der Smartphone-Kamera scannen.'),
+                      ),
+                    for (final device in devices)
+                      Draggable<ConnectedHelperDevice>(
+                        data: device,
+                        feedback: Material(
+                          elevation: 6,
+                          borderRadius: BorderRadius.circular(12),
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Text(device.displayName),
+                          ),
+                        ),
+                        child: ListTile(
+                          leading: Icon(device.online ? Icons.smartphone : Icons.phonelink_off),
+                          title: Text(device.displayName),
+                          subtitle: Text(device.checkpointName ?? 'Noch nicht zugewiesen'),
+                          trailing: device.pendingEventCount > 0
+                              ? Chip(label: Text('${device.pendingEventCount} offen'))
+                              : Icon(device.online ? Icons.circle : Icons.circle_outlined,
+                                  size: 14),
+                        ),
+                      ),
+                    const Divider(height: 28),
+                    Text('Messpunkte', style: Theme.of(context).textTheme.titleMedium),
+                    const SizedBox(height: 8),
+                    for (var index = 0; index < event.points.length; index++)
+                      DragTarget<ConnectedHelperDevice>(
+                        onAcceptWithDetails: (details) async {
+                          await _assignDevice(details.data.deviceId, event.points[index].id);
+                          await refresh();
+                        },
+                        builder: (context, candidates, rejected) {
+                          final point = event.points[index];
+                          final assigned = devices.where((d) => d.checkpointId == point.id).toList();
+                          return Card(
+                            child: ListTile(
+                              leading: CircleAvatar(child: Text('${index + 1}')),
+                              title: Text(point.name),
+                              subtitle: Text(assigned.isEmpty
+                                  ? 'Helfer hierher ziehen'
+                                  : assigned.map((d) => d.displayName).join(', ')),
+                              trailing: candidates.isNotEmpty
+                                  ? const Icon(Icons.add_circle_outline)
+                                  : const Icon(Icons.drag_indicator),
+                            ),
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton.icon(
+                onPressed: refresh,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Aktualisieren'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Schließen'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _disconnectMultiuser() async {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    _syncEngine = null;
+    _multiuserConnection = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('coachsplit_multiuser_connection');
+    await prefs.remove('coachsplit_multiuser_join_url');
+    _joinUrl = null;
+    _collaborationState = null;
+    if (mounted) {
+      setState(() => _syncMessage = 'Nicht verbunden');
+    }
+  }
+
+  Future<void> _runMultiuserSync({bool silent = false}) async {
+    final engine = _syncEngine;
+    if (engine == null || _syncBusy) return;
+    _syncBusy = true;
+    try {
+      final connection = _multiuserConnection!;
+      var event = _event;
+      if (connection.isAdministrator && event != null) {
+        await _multiuserApi.updateCompetition(
+          connection: connection,
+          competition: event.toJson(),
+        );
+      } else if (connection.role == MultiuserRole.helper) {
+        final remote = await _multiuserApi.fetchCompetition(connection);
+        final refreshed = RaceEvent.fromJson(Map<String, dynamic>.from(remote));
+        _savedEvents[refreshed.name] = refreshed;
+        _event = refreshed;
+        _currentEventKey = refreshed.name;
+        event = refreshed;
+      }
+      final pendingBefore = await _timingEventRepository.pendingSync(
+        sessionId: connection.sessionId,
+        limit: 1000,
+      );
+      final refreshedConnection = await _multiuserApi.heartbeat(
+        connection: connection,
+        pendingEventCount: pendingBefore.length,
+      );
+      if (refreshedConnection.assignmentRevision != connection.assignmentRevision ||
+          refreshedConnection.checkpointId != connection.checkpointId) {
+        _multiuserConnection = refreshedConnection;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(
+          'coachsplit_multiuser_connection',
+          jsonEncode(refreshedConnection.toJson()),
+        );
+      }
+      if (connection.isAdministrator) await _refreshCollaborationState();
+      final result = await engine.synchronize();
+      if (event != null && event.id == connection.sessionId) {
+        await _restoreTimingFromRepository(event);
+      }
+      if (!mounted) return;
+      setState(() {
+        _lastPushed = result.pushed;
+        _lastReceived = result.received;
+        _lastConflicts = result.conflicts;
+        _syncMessage = result.failed == 0
+            ? 'Synchronisiert'
+            : '${result.failed} Übertragung(en) offen';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _syncMessage = 'Offline – lokale Erfassung bleibt aktiv');
+      if (!silent) _show('Synchronisation derzeit nicht möglich: $error');
+    } finally {
+      _syncBusy = false;
+    }
+  }
+
+  Future<void> _restoreTimingFromRepository(RaceEvent event) async {
+    for (final athlete in event.athletes) {
+      athlete.captures.clear();
+      athlete.shootingResults.clear();
+      if (athlete.status == AthleteStatus.finished) {
+        athlete.status = AthleteStatus.running;
+      }
+    }
+    final events = await _timingEventRepository.forSession(event.id);
+    final cancelledIds = events
+        .where((item) => item.kind == TimingEventKind.correction && item.correctionOfEventId != null)
+        .map((item) => item.correctionOfEventId!)
+        .toSet();
+    for (final timing in events.where(
+      (item) => item.kind != TimingEventKind.correction && !cancelledIds.contains(item.id),
+    )) {
+      final athletes = event.athletes.where((item) => item.participationId == timing.participationId);
+      final points = event.points.where((item) => item.id == timing.measurementPointId);
+      if (athletes.isEmpty || points.isEmpty) continue;
+      final athlete = athletes.first;
+      final point = points.first;
+      athlete.captures[_key(point)] = athlete.startTime.add(
+        Duration(milliseconds: timing.activityTimeMs),
+      );
+      final shooting = _legacyShootingData(timing.shootingData);
+      if (shooting != null) athlete.shootingResults[_key(point)] = shooting;
+      if (point.type == PointType.finish) athlete.status = AthleteStatus.finished;
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<CaptureTimingEventService> _timingService() async {
+    final existing = _captureTimingEventService;
+    if (existing != null) return existing;
+    final prefs = await SharedPreferences.getInstance();
+    var deviceId = prefs.getString('coachsplit_v2_device_id');
+    if (deviceId == null || deviceId.isEmpty) {
+      deviceId = const Uuid().v7();
+      await prefs.setString('coachsplit_v2_device_id', deviceId);
+    }
+    final service = CaptureTimingEventService(
+      repository: _timingEventRepository,
+      createdByUserId: 'local-trainer',
+      deviceId: deviceId,
+    );
+    _captureTimingEventService = service;
+    return service;
+  }
+
+  TimingEventKind _timingKind(SplitPoint point) {
+    switch (point.type) {
+      case PointType.split:
+        return TimingEventKind.split;
+      case PointType.shootingEntry:
+        return TimingEventKind.shootingEntry;
+      case PointType.shootingExit:
+        return TimingEventKind.shootingExit;
+      case PointType.finish:
+        return TimingEventKind.finish;
+    }
+  }
+
+  ShootingData? _v2ShootingData(ShootingResult? result) {
+    if (result == null) return null;
+    return ShootingData(
+      position: result.position == ShootingPosition.standing
+          ? ShootingPositionV2.standing
+          : ShootingPositionV2.prone,
+      misses: result.misses,
+    );
+  }
+
+  ShootingResult? _legacyShootingData(ShootingData? data) {
+    if (data == null) return null;
+    return ShootingResult(
+      position: data.position == ShootingPositionV2.standing
+          ? ShootingPosition.standing
+          : ShootingPosition.prone,
+      misses: data.misses,
+    );
+  }
+
+  Future<void> _migrateAndRestoreTiming(RaceEvent event) async {
+    final service = await _timingService();
+    for (final athlete in event.athletes) {
+      for (final point in event.points) {
+        final key = _key(point);
+        final capturedAt = athlete.captures[key];
+        if (capturedAt == null) continue;
+        final migration = TimingEvent(
+          id: 'legacy_${event.id}_${athlete.participationId}_${point.id}',
+          sessionId: event.id,
+          participationId: athlete.participationId,
+          athleteId: athlete.id,
+          measurementPointId: point.id,
+          kind: _timingKind(point),
+          activityTimeMs: capturedAt.difference(athlete.startTime).inMilliseconds.clamp(0, 1 << 62) as int,
+          deviceTime: capturedAt,
+          createdByUserId: service.createdByUserId,
+          deviceId: service.deviceId,
+          shootingData: point.type == PointType.shootingExit
+              ? (_v2ShootingData(athlete.shootingResults[key]) ??
+                  ShootingData(
+                    position: point.shootingPosition == ShootingPosition.standing
+                        ? ShootingPositionV2.standing
+                        : ShootingPositionV2.prone,
+                    misses: 0,
+                  ))
+              : null,
+          syncState: SyncState.localOnly,
+        );
+        await _timingEventRepository.append(migration);
+      }
+      athlete.captures.clear();
+      athlete.shootingResults.clear();
+    }
+
+    final events = await _timingEventRepository.forSession(event.id);
+    final cancelledIds = events
+        .where((item) => item.kind == TimingEventKind.correction && item.correctionOfEventId != null)
+        .map((item) => item.correctionOfEventId!)
+        .toSet();
+    final currentEvents = events
+        .where((item) => item.kind != TimingEventKind.correction && !cancelledIds.contains(item.id));
+
+    for (final timing in currentEvents) {
+      final athleteMatches = event.athletes.where((item) => item.participationId == timing.participationId);
+      final pointMatches = event.points.where((item) => item.id == timing.measurementPointId);
+      if (athleteMatches.isEmpty || pointMatches.isEmpty) continue;
+      final athlete = athleteMatches.first;
+      final point = pointMatches.first;
+      final key = _key(point);
+      athlete.captures[key] = athlete.startTime.add(Duration(milliseconds: timing.activityTimeMs));
+      final shooting = _legacyShootingData(timing.shootingData);
+      if (shooting != null) athlete.shootingResults[key] = shooting;
+      if (point.type == PointType.finish) athlete.status = AthleteStatus.finished;
+    }
+  }
+
   Future<void> _loadStorage() async {
     final prefs = await SharedPreferences.getInstance();
     final rawGroups = prefs.getString(_groupsKey);
     if (rawGroups != null && rawGroups.trim().isNotEmpty) _groupsText.text = rawGroups;
 
+    try {
+      var snapshot = await _competitionRepository.load();
+      if (snapshot.isEmpty) {
+        final legacy = _readLegacyCompetitionSnapshot(prefs);
+        if (!legacy.isEmpty) {
+          // Sicherheitsreihenfolge: Zuerst alle alten Messungen idempotent in
+          // TimingEvents übernehmen. Erst wenn das vollständig gelungen ist,
+          // werden die Bewerbsmetadaten committed und die alte Ablage entfernt.
+          // Ein Abbruch während der Migration lässt die Originaldaten damit
+          // unangetastet und die Migration kann beim nächsten Start erneut laufen.
+          for (final event in legacy.activeEvents) {
+            await _migrateAndRestoreTiming(event);
+          }
+          await _competitionRepository.replaceAll(
+            activeEvents: legacy.activeEvents,
+            archivedEvents: legacy.archivedEvents,
+          );
+          snapshot = legacy;
+          await prefs.remove(_eventsKey);
+          await prefs.remove(_archiveKey);
+        }
+      }
+
+      _savedEvents
+        ..clear()
+        ..addEntries(snapshot.activeEvents.map((event) => MapEntry(event.name, event)));
+      _archivedEvents
+        ..clear()
+        ..addEntries(snapshot.archivedEvents.map((event) => MapEntry(event.name, event)));
+
+      // Bei bereits migrierten Bewerben werden die sichtbaren Capture-Maps
+      // ausschließlich aus den append-only TimingEvents rekonstruiert.
+      for (final event in _savedEvents.values) {
+        await _migrateAndRestoreTiming(event);
+      }
+      _storageFailure = null;
+    } catch (error) {
+      _storageFailure = 'Lokale Bewerbsdaten konnten nicht geladen werden: $error';
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _show(_storageFailure!);
+        });
+      }
+    }
+  }
+
+  CompetitionSnapshot _readLegacyCompetitionSnapshot(SharedPreferences prefs) {
+    final active = <RaceEvent>[];
+    final archived = <RaceEvent>[];
+
     final rawEvents = prefs.getString(_eventsKey);
     if (rawEvents != null) {
-      try {
-        final decoded = jsonDecode(rawEvents) as Map<String, dynamic>;
-        _savedEvents
-          ..clear()
-          ..addAll(decoded.map((k, v) => MapEntry(k, RaceEvent.fromJson(v as Map<String, dynamic>))));
-      } catch (_) {}
+      final decoded = jsonDecode(rawEvents) as Map<String, dynamic>;
+      active.addAll(decoded.values.map(
+        (value) => RaceEvent.fromJson(value as Map<String, dynamic>),
+      ));
     }
 
     final rawArchive = prefs.getString(_archiveKey);
     if (rawArchive != null) {
-      try {
-        final decoded = jsonDecode(rawArchive) as Map<String, dynamic>;
-        _archivedEvents
-          ..clear()
-          ..addAll(decoded.map((k, v) => MapEntry(k, RaceEvent.fromJson(v as Map<String, dynamic>))));
-      } catch (_) {}
+      final decoded = jsonDecode(rawArchive) as Map<String, dynamic>;
+      archived.addAll(decoded.values.map(
+        (value) => RaceEvent.fromJson(value as Map<String, dynamic>),
+      ));
     }
 
-    if (mounted) setState(() {});
+    return CompetitionSnapshot(
+      activeEvents: active,
+      archivedEvents: archived,
+    );
   }
 
-  Future<void> _saveStorage() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_groupsKey, _groupsText.text);
-    await prefs.setString(_eventsKey, jsonEncode(_savedEvents.map((k, v) => MapEntry(k, v.toJson()))));
-    await prefs.setString(_archiveKey, jsonEncode(_archivedEvents.map((k, v) => MapEntry(k, v.toJson()))));
+  Future<void> _saveStorage() {
+    // Unveränderliche Snapshots verhindern, dass ein zweiter UI-Vorgang die
+    // Daten während eines laufenden Schreibvorgangs verändert. Die Schreibkette
+    // stellt außerdem sicher, dass ältere Saves niemals neuere überschreiben.
+    final groupsSnapshot = _groupsText.text;
+    final activeSnapshot = _savedEvents.values
+        .map((event) => RaceEvent.fromJson(event.toJson()))
+        .toList(growable: false);
+    final archiveSnapshot = _archivedEvents.values
+        .map((event) => RaceEvent.fromJson(event.toJson()))
+        .toList(growable: false);
+
+    final operation = _storageWriteChain.then<void>((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_groupsKey, groupsSnapshot);
+      await _competitionRepository.replaceAll(
+        activeEvents: activeSnapshot,
+        archivedEvents: archiveSnapshot,
+      );
+      _storageFailure = null;
+    });
+
+    _storageWriteChain = operation.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        _storageFailure = 'Lokales Speichern fehlgeschlagen: $error';
+      },
+    );
+    return operation;
   }
 
   DateTime _futureDateForTime(TimeOfDay time, {DateTime? reference}) {
-    final now = reference ?? DateTime.now();
+    final now = reference ?? _competitionClock.nowDateTime();
     var result = DateTime(now.year, now.month, now.day, time.hour, time.minute);
     if (result.isBefore(now)) result = result.add(const Duration(days: 1));
     return result;
@@ -227,9 +860,24 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     }
   }
 
-  int _nextShootingRangeNumber(List<SplitPoint> points) {
-    final values = points.map((p) => p.shootingRangeNumber ?? 0);
-    return values.isEmpty ? 1 : values.reduce(max) + 1;
+  int _nextShootingRangeNumber(List<SplitPoint> points) =>
+      _shootingRangeNumberService.nextNumber(points);
+
+  void _normalizeShootingRangeNumbers(List<SplitPoint> points) {
+    var nextNumber = 0;
+    int? openRangeNumber;
+    for (final point in points) {
+      if (point.type == PointType.shootingEntry) {
+        openRangeNumber = ++nextNumber;
+        point.shootingRangeNumber = openRangeNumber;
+        point.name = 'Schießstand $openRangeNumber ein';
+      } else if (point.type == PointType.shootingExit) {
+        final number = openRangeNumber ?? ++nextNumber;
+        point.shootingRangeNumber = number;
+        point.name = 'Schießstand $number aus';
+        openRangeNumber = null;
+      }
+    }
   }
 
   Future<List<SplitPoint>?> _pointFromTemplateDialog(List<SplitPoint> points) async {
@@ -254,12 +902,46 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           ),
           const SizedBox(height: 8),
           FilledButton.tonalIcon(
-            onPressed: () {
+            onPressed: () async {
+              final position = await showDialog<ShootingPosition>(
+                context: context,
+                barrierDismissible: false,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('Schießstand anlegen'),
+                  content: const Text('Welcher Anschlag wird an diesem Schießstand geschossen?'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Abbrechen'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => Navigator.pop(dialogContext, ShootingPosition.prone),
+                      child: const Text('Liegend'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(dialogContext, ShootingPosition.standing),
+                      child: const Text('Stehend'),
+                    ),
+                  ],
+                ),
+              );
+              if (position == null || !context.mounted) return;
               final number = _nextShootingRangeNumber(points);
               final base = 'shoot_${DateTime.now().microsecondsSinceEpoch}';
               Navigator.pop(context, [
-                SplitPoint(id: '${base}_in', name: 'Schießstand $number ein', type: PointType.shootingEntry, shootingRangeNumber: number),
-                SplitPoint(id: '${base}_out', name: 'Schießstand $number aus', type: PointType.shootingExit, shootingRangeNumber: number),
+                SplitPoint(
+                  id: '${base}_in',
+                  name: 'Schießstand $number ein',
+                  type: PointType.shootingEntry,
+                  shootingRangeNumber: number,
+                ),
+                SplitPoint(
+                  id: '${base}_out',
+                  name: 'Schießstand $number aus',
+                  type: PointType.shootingExit,
+                  shootingRangeNumber: number,
+                  shootingPosition: position,
+                ),
               ]);
             },
             icon: const Icon(Icons.my_location),
@@ -303,8 +985,9 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       points.addAll(newPoints);
       points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
     }
+    _normalizeShootingRangeNumbers(points);
     setState(() {
-      _pointsText.text = points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
+      _pointsText.text = points.map(_pointSetupLine).join('\n');
       if (_event != null && !_hasRaceData()) _event!.points = points;
     });
     await _saveSetupFromFields();
@@ -324,8 +1007,15 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     if (_currentEventKey == copy.name) _currentEventKey = null;
 
     await _saveStorage();
-    setState(() {});
-    _show('Bewerb archiviert');
+    if (!mounted) return;
+    setState(() {
+      _event = null;
+      _viewingArchivedEvent = false;
+      _setupReady = false;
+      _autoStartEnabled = false;
+      _page = 0;
+    });
+    _show('Bewerb archiviert · zurück im Setup');
   }
 
   void _viewArchivedEvent(RaceEvent archived) {
@@ -467,6 +1157,24 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     }
   }
 
+  String _shootingPositionLabel(ShootingPosition? position, {bool short = false}) {
+    if (position == ShootingPosition.standing) return short ? 'S' : 'Stehend';
+    return short ? 'L' : 'Liegend';
+  }
+
+  String _pointDisplayName(SplitPoint point) {
+    if (point.type != PointType.shootingExit) return point.name;
+    return '${point.name} (${_shootingPositionLabel(point.shootingPosition).toLowerCase()})';
+  }
+
+  String _pointSetupLine(SplitPoint point) {
+    final token = _pointTypeToken(point);
+    if (point.type == PointType.shootingExit) {
+      return '${point.name}, $token:${point.shootingPosition?.name ?? ShootingPosition.prone.name}';
+    }
+    return '${point.name}, $token';
+  }
+
   List<SplitPoint> _parsePoints(String text) {
     final lines = text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
     final splits = <SplitPoint>[];
@@ -476,18 +1184,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       final typeRaw = parts.length > 1 ? parts[1].toLowerCase() : 'split';
       final isFinish = typeRaw.contains('ziel') || typeRaw.contains('finish') || rawName.toLowerCase() == 'ziel';
       if (isFinish) continue;
-      final numberMatch = RegExp(r'(\d+)').firstMatch(rawName);
-      final rangeNumber = numberMatch == null ? null : int.tryParse(numberMatch.group(1)!);
       final type = typeRaw.contains('shootingentry') || rawName.toLowerCase().contains('schießstand') && rawName.toLowerCase().endsWith(' ein')
           ? PointType.shootingEntry
           : typeRaw.contains('shootingexit') || rawName.toLowerCase().contains('schießstand') && rawName.toLowerCase().endsWith(' aus')
               ? PointType.shootingExit
               : PointType.split;
+      final numberMatch = RegExp(r'(\d+)').firstMatch(rawName);
+      final rangeNumber = type == PointType.shootingEntry || type == PointType.shootingExit
+          ? (numberMatch == null ? null : int.tryParse(numberMatch.group(1)!))
+          : null;
+      final shootingPosition = type != PointType.shootingExit
+          ? null
+          : typeRaw.contains('standing') || typeRaw.contains('stehend')
+              ? ShootingPosition.standing
+              : ShootingPosition.prone;
       splits.add(SplitPoint(
         id: 'p_${i}_${type.name}',
         name: rawName.isEmpty ? 'Messpunkt ${splits.length + 1}' : rawName,
         type: type,
         shootingRangeNumber: rangeNumber,
+        shootingPosition: shootingPosition,
       ));
     }
     return [...splits, SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish)];
@@ -638,7 +1354,8 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
         event.points.addAll(newPoints);
         event.points.add(SplitPoint(id: 'p_finish', name: 'Ziel', type: PointType.finish));
       }
-      _pointsText.text = event.points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
+      _normalizeShootingRangeNumbers(event.points);
+      _pointsText.text = event.points.map(_pointSetupLine).join('\n');
     });
     await _saveEvent();
     _show(newPoints.length == 2 ? 'Schießstand hinzugefügt' : 'Messpunkt hinzugefügt');
@@ -793,13 +1510,25 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _archivedEvents[name] = RaceEvent.fromJson(removed.toJson());
     }
 
-    if (_currentEventKey == name) {
+    final wasCurrentEvent = _currentEventKey == name;
+    if (wasCurrentEvent) {
       _currentEventKey = null;
     }
 
     await _saveStorage();
-    setState(() {});
-    _show(action == 'archive' ? 'Bewerb archiviert' : 'Bewerb gelöscht');
+    if (!mounted) return;
+    setState(() {
+      if (wasCurrentEvent) {
+        _event = null;
+        _viewingArchivedEvent = false;
+        _setupReady = false;
+        _autoStartEnabled = false;
+        _page = 0;
+      }
+    });
+    _show(action == 'archive'
+        ? 'Bewerb archiviert · zurück im Setup'
+        : 'Bewerb gelöscht');
   }
 
   void _loadEvent(RaceEvent event) {
@@ -815,7 +1544,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       _competitionClock.restore(copy.clockCalibration);
       _firstStartTime = TimeOfDay.fromDateTime(copy.firstStart);
       _athletesText.text = copy.athletes.map((a) => '${a.bib}, ${a.name}, ${a.category}${a.isOwn ? ', *' : ''}, ${_formatClock(a.scheduledStart)}').join('\n');
-      _pointsText.text = copy.points.map((p) => '${p.name}, ${_pointTypeToken(p)}').join('\n');
+      _pointsText.text = copy.points.map(_pointSetupLine).join('\n');
       _autoStartEnabled = false;
       _setupReady = copy.status != CompetitionStatus.draft || _hasRaceData(copy);
       _page = _setupReady ? 1 : 0;
@@ -907,10 +1636,81 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   String _formatTimeOfDay24(TimeOfDay time) =>
       '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
 
+  Future<void> _chooseDnfAthlete() async {
+    final event = _event;
+    if (event == null) return;
+    final active = event.athletes
+        .where((athlete) => athlete.status == AthleteStatus.running)
+        .toList()
+      ..sort((a, b) => a.bib.compareTo(b.bib));
+    if (active.isEmpty) {
+      _show('Keine laufenden Athleten für DNF.');
+      return;
+    }
+    final athlete = await showModalBottomSheet<Athlete>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const ListTile(
+              title: Text('Athlet als DNF markieren', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text('Bisherige Messungen bleiben erhalten.'),
+            ),
+            for (final item in active)
+              ListTile(
+                leading: _Bib(bib: item.bib),
+                title: Text(item.name.toUpperCase()),
+                subtitle: Text('${item.category} · ${_lastStand(item)}'),
+                onTap: () => Navigator.pop(context, item),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (athlete != null) await _markDnf(athlete);
+  }
+
+  Future<void> _abortRunningCompetition() async {
+    final event = _event;
+    if (event == null || event.status != CompetitionStatus.running) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Laufenden Test abbrechen?'),
+        content: const Text(
+          'Alle in diesem Lauf erfassten Start-, Zwischen-, Schieß- und Zielzeiten werden verworfen. '
+          'Athleten, Messpunkte, Strafregel und Kalibrierung bleiben für einen neuen Test erhalten.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Weiterlaufen lassen')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Abbrechen und Setup öffnen')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() {
+      _autoStartEnabled = false;
+      event.status = CompetitionStatus.draft;
+      for (var index = 0; index < event.athletes.length; index++) {
+        final athlete = event.athletes[index];
+        athlete.status = AthleteStatus.waiting;
+        athlete.actualStart = null;
+        athlete.captures.clear();
+        athlete.shootingResults.clear();
+      }
+      _setupReady = false;
+      _page = 0;
+    });
+    await _saveEvent();
+    _show('Lauf abgebrochen. Setup ist wieder geöffnet.');
+  }
+
   void _toggleAutoStart() {
     final enable = !_autoStartEnabled;
     if (enable && _event != null) {
-      final now = DateTime.now();
+      final now = _competitionClock.nowDateTime();
       for (final athlete in _event!.athletes.where((a) => a.status == AthleteStatus.waiting)) {
         while (athlete.scheduledStart.isBefore(now)) {
           athlete.scheduledStart = athlete.scheduledStart.add(const Duration(days: 1));
@@ -925,7 +1725,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     if (!_autoStartEnabled) return;
     final event = _event;
     if (event == null) return;
-    final now = DateTime.now();
+    final now = _competitionClock.nowDateTime();
     var changed = false;
     for (final athlete in event.athletes) {
       if (athlete.status == AthleteStatus.waiting && !now.isBefore(athlete.scheduledStart)) {
@@ -1001,7 +1801,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final parsed = _parseClock(value);
     if (parsed == null) return fallback;
     var result = DateTime(fallback.year, fallback.month, fallback.day, parsed.$1, parsed.$2, parsed.$3);
-    if (result.isBefore(DateTime.now())) result = result.add(const Duration(days: 1));
+    if (result.isBefore(_competitionClock.nowDateTime())) result = result.add(const Duration(days: 1));
     return result;
   }
 
@@ -1062,39 +1862,103 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     );
   }
 
-  Future<ShootingResult?> _shootingResultDialog(Athlete athlete, SplitPoint point) async {
-    ShootingPosition? position;
+  Future<ShootingResult?> _shootingResultDialog(
+    Athlete athlete,
+    SplitPoint point,
+  ) async {
+    var position = point.shootingPosition;
     int? misses;
+
     return showDialog<ShootingResult>(
       context: context,
       barrierDismissible: false,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text('${athlete.bib} ${athlete.name} · ${point.name}'),
-          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const Text('Anschlag', style: TextStyle(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            SegmentedButton<ShootingPosition>(
-              segments: const [
-                ButtonSegment(value: ShootingPosition.prone, label: Text('L'), icon: Icon(Icons.horizontal_rule)),
-                ButtonSegment(value: ShootingPosition.standing, label: Text('S'), icon: Icon(Icons.accessibility_new)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (position != null)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    'Anschlag: ${_shootingPositionLabel(position)}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                )
+              else ...[
+                const Text(
+                  'Anschlag für älteren Messpunkt festlegen',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<ShootingPosition>(
+                  segments: const [
+                    ButtonSegment(
+                      value: ShootingPosition.prone,
+                      label: Text('Liegend'),
+                    ),
+                    ButtonSegment(
+                      value: ShootingPosition.standing,
+                      label: Text('Stehend'),
+                    ),
+                  ],
+                  selected: position == null
+                      ? <ShootingPosition>{}
+                      : {position!},
+                  emptySelectionAllowed: true,
+                  onSelectionChanged: (selection) {
+                    setDialogState(
+                      () => position =
+                          selection.isEmpty ? null : selection.first,
+                    );
+                  },
+                ),
               ],
-              selected: position == null ? <ShootingPosition>{} : {position!},
-              emptySelectionAllowed: true,
-              onSelectionChanged: (selection) => setDialogState(() => position = selection.isEmpty ? null : selection.first),
-            ),
-            const SizedBox(height: 16),
-            const Text('Schießfehler', style: TextStyle(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            Wrap(spacing: 8, runSpacing: 8, children: [
-              for (var value = 0; value <= 5; value++)
-                ChoiceChip(label: Text('$value'), selected: misses == value, onSelected: (_) => setDialogState(() => misses = value)),
-            ]),
-          ]),
+              const SizedBox(height: 16),
+              const Text(
+                'Schießfehler',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (var value = 0; value <= 5; value++)
+                    ChoiceChip(
+                      label: Text('$value'),
+                      selected: misses == value,
+                      onSelected: (_) =>
+                          setDialogState(() => misses = value),
+                    ),
+                ],
+              ),
+            ],
+          ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Abbrechen')),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Abbrechen'),
+            ),
             FilledButton(
-              onPressed: position == null || misses == null ? null : () => Navigator.pop(context, ShootingResult(position: position!, misses: misses!)),
+              onPressed: position == null || misses == null
+                  ? null
+                  : () {
+                      point.shootingPosition ??= position;
+                      Navigator.pop(
+                        context,
+                        ShootingResult(
+                          position: position!,
+                          misses: misses!,
+                        ),
+                      );
+                    },
               child: const Text('Zeit übernehmen'),
             ),
           ],
@@ -1105,6 +1969,8 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
   Future<void> _capture(Athlete athlete, SplitPoint point) async {
     if (athlete.status != AthleteStatus.running) return;
+    final event = _event;
+    if (event == null) return;
     final key = _key(point);
     if (athlete.captures.containsKey(key)) return;
 
@@ -1116,20 +1982,49 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     final oldStatus = athlete.status;
     final now = _competitionClock.nowDateTime();
+    TimingEvent persistedEvent;
+    try {
+      final service = await _timingService();
+      persistedEvent = await service.capture(
+        sessionId: event.id,
+        participationId: athlete.participationId,
+        athleteId: athlete.id,
+        measurementPointId: point.id,
+        kind: _timingKind(point),
+        athleteStart: athlete.startTime,
+        capturedAt: now,
+        shootingData: _v2ShootingData(shootingResult),
+      );
+    } catch (error) {
+      if (mounted) {
+        _show('Zeit konnte nicht sicher gespeichert werden: $error');
+      }
+      return;
+    }
 
+    if (!mounted) return;
     setState(() {
       athlete.captures[key] = now;
-      if (shootingResult != null) athlete.shootingResults[key] = shootingResult;
+      if (shootingResult != null) athlete.shootingResults[key] = shootingResult!;
       if (point.type == PointType.finish) athlete.status = AthleteStatus.finished;
     });
-    _saveEvent();
+    await _saveEvent();
+    unawaited(_runMultiuserSync(silent: true));
 
-    _undoSnack(_feedbackText(athlete, point), () {
-      setState(() {
-        athlete.captures.remove(key);
-        athlete.shootingResults.remove(key);
-        athlete.status = oldStatus;
-      });
+    _undoSnack(_feedbackText(athlete, point), () async {
+      try {
+        final service = await _timingService();
+        await service.cancel(persistedEvent, _competitionClock.nowDateTime());
+        if (!mounted) return;
+        setState(() {
+          athlete.captures.remove(key);
+          athlete.shootingResults.remove(key);
+          athlete.status = oldStatus;
+        });
+        await _saveEvent();
+      } catch (error) {
+        if (mounted) _show('Rückgängig konnte nicht gespeichert werden: $error');
+      }
     }, duration: point.type == PointType.shootingExit ? const Duration(seconds: 4) : const Duration(seconds: 2));
   }
 
@@ -1145,9 +2040,17 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     if (point.type == PointType.shootingExit) {
       final result = athlete.shootingResults[_key(point)];
-      final position = result?.position == ShootingPosition.prone ? 'L' : 'S';
+      final position = _shootingPositionLabel(
+        point.shootingPosition ?? result?.position,
+        short: true,
+      );
       final placement = _placementGapFeedback(rows, row);
-      return '✓ ${athlete.bib} ${athlete.name} · ${point.name} · $position · ${result?.misses ?? 0} Fehler · $placement';
+      final captured = _captureTime(athlete, point);
+      final raw = captured == null ? Duration.zero : _elapsed(athlete, captured);
+      final penalty = _penaltyThroughPoint(athlete, point);
+      final official = raw + penalty;
+      final penaltyText = penalty == Duration.zero ? '' : ' · Strafe +${_fmtDuration(penalty)}';
+      return '✓ ${athlete.bib} ${athlete.name} · ${_pointDisplayName(point)} · Schießen $position · ${result?.misses ?? 0} Fehler · Lauf ${_fmtDuration(raw)}$penaltyText · Wertung ${_fmtDuration(official)} · $placement';
     }
 
     final trend = row.sectionDelta == null ? 'Trend —' : 'Trend +${_fmtDuration(row.sectionDelta!)}';
@@ -1231,10 +2134,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return count;
   }
 
+  List<RankRow> _rawRanking(SplitPoint point) {
+    final event = _event;
+    if (event == null) return const [];
+    return _rankingService.calculate(
+      athletes: event.athletes,
+      point: point,
+      compareByCategory: event.compareByCategory,
+      captureTime: _captureTime,
+      elapsed: (athlete, _, time) => _elapsed(athlete, time),
+      sectionDuration: _sectionDuration,
+      groupFor: _group,
+    );
+  }
+
   Duration _trendCorrection(Athlete athlete, SplitPoint point) {
     final previous = _previousPoint(point);
     if (previous == null) return Duration.zero;
-    final prevRows = _ranking(previous);
+    // Die Ankunftsprognose bildet nur die Laufleistung ab. Strafzeiten
+    // beeinflussen Rang und Rückstand, aber nicht die erwartete Reihenfolge.
+    final prevRows = _rawRanking(previous);
     final own = prevRows.where((r) => r.athlete.bib == athlete.bib).toList();
     if (own.isEmpty) return Duration.zero;
     final totalDelta = own.first.deltaToLeader;
@@ -1291,87 +2210,76 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     return candidates.take(isFirstPoint ? 15 : 6).toList();
   }
 
-  int _totalMisses(Athlete athlete) => athlete.shootingResults.values.fold(0, (sum, result) => sum + result.misses);
+  int _totalMisses(Athlete athlete) => _penaltyService.totalMisses(athlete);
+
+  int _missesThroughPoint(Athlete athlete, SplitPoint point) {
+    final event = _event;
+    if (event == null) return 0;
+    final targetIndex = event.points.indexWhere((candidate) => candidate.id == point.id);
+    if (targetIndex < 0) return 0;
+
+    var misses = 0;
+    for (var index = 0; index <= targetIndex; index++) {
+      final candidate = event.points[index];
+      if (candidate.type != PointType.shootingExit) continue;
+      misses += athlete.shootingResults[_key(candidate)]?.misses ?? 0;
+    }
+    return misses;
+  }
+
+  Duration _penaltyAtShootingPoint(
+    Athlete athlete,
+    SplitPoint point,
+  ) {
+    final event = _event;
+    if (event == null || point.type != PointType.shootingExit) {
+      return Duration.zero;
+    }
+    final misses = athlete.shootingResults[_key(point)]?.misses ?? 0;
+    return _penaltyService.penaltyForMisses(
+      misses: misses,
+      enabled: event.timePenaltyEnabled,
+      secondsPerMiss: event.penaltySecondsPerMiss,
+    );
+  }
+
+  Duration _penaltyThroughPoint(Athlete athlete, SplitPoint point) {
+    final event = _event;
+    if (event == null) return Duration.zero;
+    return _penaltyService.penaltyForMisses(
+      misses: _missesThroughPoint(athlete, point),
+      enabled: event.timePenaltyEnabled,
+      secondsPerMiss: event.penaltySecondsPerMiss,
+    );
+  }
 
   Duration _penaltyFor(Athlete athlete) {
     final event = _event;
-    if (event == null || !event.timePenaltyEnabled || event.penaltySecondsPerMiss <= 0) return Duration.zero;
-    return Duration(seconds: _totalMisses(athlete) * event.penaltySecondsPerMiss);
+    if (event == null) return Duration.zero;
+    return _penaltyService.penaltyFor(
+      athlete: athlete,
+      enabled: event.timePenaltyEnabled,
+      secondsPerMiss: event.penaltySecondsPerMiss,
+    );
   }
 
   Duration _officialElapsed(Athlete athlete, SplitPoint point, DateTime time) {
     final raw = _elapsed(athlete, time);
-    return point.type == PointType.finish ? raw + _penaltyFor(athlete) : raw;
+    return raw + _penaltyThroughPoint(athlete, point);
   }
 
   List<RankRow> _ranking(SplitPoint point) {
     final event = _event;
-    if (event == null) return [];
-    final raw = <MapEntry<Athlete, Duration>>[];
-    for (final athlete in event.athletes) {
-      final time = _captureTime(athlete, point);
-      if (time == null) continue;
-      raw.add(MapEntry(athlete, _officialElapsed(athlete, point, time)));
-    }
-
-    final grouped = <String, List<MapEntry<Athlete, Duration>>>{};
-    for (final item in raw) {
-      grouped.putIfAbsent(_group(item.key), () => []).add(item);
-    }
-
-    final rows = <RankRow>[];
-    for (final groupRows in grouped.values) {
-      groupRows.sort((a, b) => a.value.compareTo(b.value));
-      if (groupRows.isEmpty) continue;
-      final leader = groupRows.first.value;
-      final athletesInGroup = groupRows.map((e) => e.key).toList();
-      final sectionDeltas = _sectionDeltas(point, athletesInGroup);
-      final sectionPlaces = _sectionPlaces(point, athletesInGroup);
-
-      for (var i = 0; i < groupRows.length; i++) {
-        final athlete = groupRows[i].key;
-        rows.add(RankRow(
-          athlete: athlete,
-          elapsed: groupRows[i].value,
-          place: i + 1,
-          deltaToLeader: groupRows[i].value - leader,
-          sectionElapsed: _sectionDuration(athlete, point),
-          sectionDelta: sectionDeltas[athlete.bib],
-          sectionPlace: sectionPlaces[athlete.bib],
-        ));
-      }
-    }
-
-    rows.sort((a, b) {
-      final event = _event;
-      if (event != null && event.compareByCategory) {
-        final cat = a.athlete.category.compareTo(b.athlete.category);
-        if (cat != 0) return cat;
-      }
-      return a.place.compareTo(b.place);
-    });
-    return rows;
-  }
-
-  Map<int, int> _sectionPlaces(SplitPoint point, List<Athlete> athletes) {
-    final values = <MapEntry<int, Duration>>[];
-    for (final athlete in athletes) {
-      final section = _sectionDuration(athlete, point);
-      if (section != null) values.add(MapEntry(athlete.bib, section));
-    }
-    values.sort((a, b) => a.value.compareTo(b.value));
-    return {for (var i = 0; i < values.length; i++) values[i].key: i + 1};
-  }
-
-  Map<int, Duration> _sectionDeltas(SplitPoint point, List<Athlete> athletes) {
-    final values = <int, Duration>{};
-    for (final athlete in athletes) {
-      final section = _sectionDuration(athlete, point);
-      if (section != null) values[athlete.bib] = section;
-    }
-    if (values.isEmpty) return {};
-    final best = values.values.reduce((a, b) => a <= b ? a : b);
-    return values.map((bib, duration) => MapEntry(bib, duration - best));
+    if (event == null) return const [];
+    return _rankingService.calculate(
+      athletes: event.athletes,
+      point: point,
+      compareByCategory: event.compareByCategory,
+      captureTime: _captureTime,
+      elapsed: _officialElapsed,
+      sectionDuration: _sectionDuration,
+      groupFor: _group,
+    );
   }
 
   String _lastStand(Athlete athlete) {
@@ -1398,32 +2306,31 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   }
 
   Duration? _liveGapToLeader(Athlete athlete, SplitPoint point) {
-    final rows = _ranking(point);
-    final currentElapsed = DateTime.now().difference(athlete.startTime);
+    final group = _group(athlete);
+    final rows = _ranking(point)
+        .where((row) => _group(row.athlete) == group)
+        .toList();
+    if (rows.isEmpty) return null;
 
-    if (rows.isEmpty) {
-      return currentElapsed;
-    }
-
-    final leaderElapsed = rows.map((r) => r.elapsed).reduce((a, b) => a <= b ? a : b);
-    return currentElapsed - leaderElapsed;
+    final currentRaw = _competitionClock.nowDateTime().difference(athlete.startTime);
+    final currentOfficial = currentRaw + _penaltyThroughPoint(athlete, point);
+    final leaderElapsed = rows
+        .map((row) => row.elapsed)
+        .reduce((a, b) => a <= b ? a : b);
+    return currentOfficial - leaderElapsed;
   }
 
   String _liveGapText(Athlete athlete, SplitPoint point) {
-    final rows = _ranking(point);
     final value = _liveGapToLeader(athlete, point);
     if (value == null) return '—';
-
-    if (rows.isEmpty) return _fmtLiveDuration(value);
-
-    if (value.inSeconds == 0) return '0:00';
+    if (value.inMilliseconds.abs() < 500) return '0:00';
     final sign = value.isNegative ? '-' : '+';
     return '$sign${_fmtLiveDuration(value.abs())}';
   }
 
   String _eta(DateTime? time) {
     if (time == null) return '—';
-    final diff = time.difference(DateTime.now());
+    final diff = time.difference(_competitionClock.nowDateTime());
     final sign = diff.isNegative ? '+' : '';
     return '$sign${_fmtCountdown(diff.abs())}';
   }
@@ -1613,10 +2520,26 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     final finalRows = _ranking(rankingPoint);
     final splitPoints = event.points.where((p) => p.type != PointType.finish).toList();
     final rows = <List<String>>[];
-    rows.add(['Pl', 'Nr', 'Name', ...splitPoints.map((p) => p.name), 'Ziel']);
+    rows.add(['Pl', 'Nr', 'Name', ...splitPoints.map(_pointDisplayName), 'Ziel']);
+    String? lastCategory;
     for (final finalRow in finalRows) {
       final athlete = finalRow.athlete;
-      rows.add(['${finalRow.place}', '${athlete.bib}', athlete.name, for (final p in splitPoints) _sectionPlaceText(athlete, p), _sectionPlaceText(athlete, rankingPoint)]);
+      if (event.compareByCategory && athlete.category != lastCategory) {
+        lastCategory = athlete.category;
+        rows.add(['[[GROUP:${athlete.category}]]']);
+      }
+      rows.add([
+        '${finalRow.place}',
+        '${athlete.bib}',
+        athlete.name,
+        for (final p in splitPoints)
+          p.type == PointType.shootingExit
+              ? '${_sectionPlaceText(athlete, p)} '
+                  '[[PENALTY:${_penaltyAtShootingPoint(athlete, p).inSeconds}]] '
+                  '[[MISS:${athlete.shootingResults[_key(p)]?.misses ?? -1}]]'
+              : _sectionPlaceText(athlete, p),
+        _sectionPlaceText(athlete, rankingPoint),
+      ]);
     }
     return rows;
   }
@@ -1688,12 +2611,102 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
     for (var r = 0; r < rows.length; r++) {
       final isHeader = r == 0;
       final y = tableRect.top + r * rowHeight;
-      if (r > 0 && r.isEven) canvas.drawRect(Rect.fromLTWH(tableRect.left, y, tableRect.width, rowHeight), stripePaint);
-      canvas.drawLine(Offset(tableRect.left, y), Offset(tableRect.right, y), linePaint);
+      final isGroupRow =
+          rows[r].length == 1 && rows[r].first.startsWith('[[GROUP:');
+      if (isGroupRow) {
+        final label = rows[r].first
+            .replaceFirst('[[GROUP:', '')
+            .replaceFirst(']]', '');
+        canvas.drawRect(
+          Rect.fromLTWH(tableRect.left, y, tableRect.width, rowHeight),
+          Paint()..color = const Color(0xFF263442),
+        );
+        canvas.drawLine(
+          Offset(tableRect.left, y),
+          Offset(tableRect.right, y),
+          linePaint,
+        );
+        drawText(
+          label,
+          tableRect.left + 12,
+          y + 10,
+          16,
+          Colors.white,
+          w: FontWeight.w800,
+          maxWidth: tableRect.width - 24,
+        );
+        continue;
+      }
+      if (r > 0 && r.isEven) {
+        canvas.drawRect(
+          Rect.fromLTWH(tableRect.left, y, tableRect.width, rowHeight),
+          stripePaint,
+        );
+      }
+      canvas.drawLine(
+        Offset(tableRect.left, y),
+        Offset(tableRect.right, y),
+        linePaint,
+      );
       var x = tableRect.left;
       for (var c = 0; c < colCount; c++) {
         canvas.drawLine(Offset(x, y), Offset(x, y + rowHeight), linePaint);
-        drawText(rows[r][c], x + 10, y + 11, isHeader ? 16 : 15, isHeader ? Colors.white : const Color(0xFFE8EEF4), w: isHeader ? FontWeight.w700 : FontWeight.w500, maxWidth: colWidths[c] - 20);
+        final cellValue = rows[r][c];
+        final missMatch =
+            RegExp(r'\[\[MISS:(-?\d+)\]\]').firstMatch(cellValue);
+        final penaltyMatch =
+            RegExp(r'\[\[PENALTY:(\d+)\]\]').firstMatch(cellValue);
+        final textValue = cellValue
+            .replaceAll(RegExp(r'\s*\[\[MISS:-?\d+\]\]'), '')
+            .replaceAll(RegExp(r'\s*\[\[PENALTY:\d+\]\]'), '');
+        final hasShootingDetails =
+            !isHeader && (missMatch != null || penaltyMatch != null);
+        drawText(
+          textValue,
+          x + 10,
+          y + 11,
+          isHeader ? 16 : 15,
+          isHeader ? Colors.white : const Color(0xFFE8EEF4),
+          w: isHeader ? FontWeight.w700 : FontWeight.w500,
+          maxWidth: colWidths[c] - (hasShootingDetails ? 112 : 20),
+        );
+        if (!isHeader && penaltyMatch != null) {
+          final penaltySeconds =
+              int.tryParse(penaltyMatch.group(1) ?? '0') ?? 0;
+          if (penaltySeconds > 0) {
+            drawText(
+              '+${penaltySeconds}s',
+              x + colWidths[c] - 93,
+              y + 12,
+              14,
+              const Color(0xFFFFD166),
+              w: FontWeight.w800,
+              maxWidth: 54,
+            );
+          }
+        }
+        if (!isHeader && missMatch != null) {
+          final misses = int.tryParse(missMatch.group(1) ?? '-1') ?? -1;
+          final center = Offset(x + colWidths[c] - 25, y + rowHeight / 2);
+          canvas.drawCircle(center, 14, Paint()..color = Colors.white);
+          canvas.drawCircle(
+            center,
+            14,
+            Paint()
+              ..color = Colors.black
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.5,
+          );
+          drawText(
+            misses < 0 ? '–' : '$misses',
+            center.dx - 5,
+            center.dy - 9,
+            15,
+            Colors.black,
+            w: FontWeight.w900,
+            maxWidth: 12,
+          );
+        }
         x += colWidths[c];
       }
       canvas.drawLine(Offset(tableRect.right, y), Offset(tableRect.right, y + rowHeight), linePaint);
@@ -1736,7 +2749,7 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
 
     for (var i = 0; i < points.length; i++) {
       final x = points.length <= 1 ? chartLeft : chartLeft + i * ((chartRight - chartLeft) / (points.length - 1));
-      drawText(points[i].type == PointType.finish ? 'Ziel' : points[i].name, x - 28, chartBottom + 18, 14, const Color(0xFFE8EEF4), maxWidth: 80);
+      drawText(points[i].type == PointType.finish ? 'Ziel' : _pointDisplayName(points[i]), x - 28, chartBottom + 18, 14, const Color(0xFFE8EEF4), maxWidth: 80);
     }
 
     final colors = [const Color(0xFF2F8CFF), const Color(0xFFFF3B30), const Color(0xFF4CAF50), const Color(0xFF9B59B6), const Color(0xFFFF8C00), const Color(0xFF00A6B2), const Color(0xFFFFC107), const Color(0xFFE91E63), const Color(0xFF8BC34A), const Color(0xFF03A9F4)];
@@ -1986,13 +2999,67 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
   @override
   Widget build(BuildContext context) {
     final event = _event;
+    if (!_storageReady) {
+      return const Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Lokale Daten werden geladen …'),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    if (_storageFailure != null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('CoachSplit 1.0.6 RC6.3')),
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.storage_outlined, size: 52),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Lokaler Speicher nicht verfügbar',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(_storageFailure!, textAlign: TextAlign.center),
+                  const SizedBox(height: 20),
+                  FilledButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        _storageReady = false;
+                        _storageFailure = null;
+                      });
+                      _initializeStorage();
+                    },
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Erneut versuchen'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: Row(children: [
           Image.asset('assets/icon/coachsplit_icon.png', width: 38, height: 38),
           const SizedBox(width: 10),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('CoachSplit 1.0.4 RC2'),
+            const Text('CoachSplit 1.0.6 RC6.3'),
             Text(event == null ? 'Kein Bewerb' : '${event.name} · ${event.compareByCategory ? 'AK' : 'Alle'}', style: Theme.of(context).textTheme.bodySmall),
           ])),
         ]),
@@ -2001,6 +3068,10 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
         child: Column(children: [
           _Stats(event: event),
           _Nav(selected: _page, setupLocked: event?.status == CompetitionStatus.running, onChanged: (i) {
+            if (_multiuserConnection?.role == MultiuserRole.helper && i != 2 && i != 3) {
+              _show('Im Helfermodus sind nur Erfassung und Live-Ergebnisse verfügbar.');
+              return;
+            }
             if (i > 0 && !_setupReady) {
               _show('Bitte zuerst im Setup auf "Zum Start" tippen.');
               return;
@@ -2061,6 +3132,61 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
               ],
             ),
         ])),
+        _Section(
+          title: 'Zusammenarbeit',
+          subtitle: 'Optional: Ein QR-Code, mehrere Helfer, Zuweisung in der Leitstelle',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (_multiuserConnection == null)
+                FilledButton.icon(
+                  onPressed: _syncBusy ? null : _createMultiuserSession,
+                  icon: const Icon(Icons.group_add_outlined),
+                  label: const Text('Helfer verbinden'),
+                )
+              else ...[
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    _syncMessage.startsWith('Offline')
+                        ? Icons.cloud_off_outlined
+                        : Icons.cloud_done_outlined,
+                  ),
+                  title: Text(_syncMessage),
+                  subtitle: Text(
+                    _multiuserConnection!.isAdministrator
+                        ? '${_collaborationState?.devices.length ?? 0} Helfer verbunden'
+                        : _multiuserConnection!.isAssigned
+                            ? 'Messpunkt ${_multiuserConnection!.checkpointName}'
+                            : 'Verbunden · warte auf Zuweisung',
+                  ),
+                ),
+                if (_multiuserConnection!.isAdministrator)
+                  FilledButton.icon(
+                    onPressed: _syncBusy ? null : _showControlCenter,
+                    icon: const Icon(Icons.hub_outlined),
+                    label: const Text('Leitstelle öffnen'),
+                  ),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _syncBusy ? null : () => _runMultiuserSync(),
+                      icon: const Icon(Icons.sync),
+                      label: const Text('Jetzt synchronisieren'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    tooltip: 'Verbindung trennen',
+                    onPressed: _disconnectMultiuser,
+                    icon: const Icon(Icons.link_off),
+                  ),
+                ]),
+              ],
+            ],
+          ),
+        ),
         _Section(title: 'Bewerb bearbeiten', subtitle: 'Startzeit, Startliste und Messpunkte', child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           TextField(controller: _eventName, decoration: const InputDecoration(labelText: 'Bewerb / Training'), onChanged: (_) => _scheduleSetupAutosave()),
           const SizedBox(height: 8),
@@ -2162,36 +3288,105 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
           ]),
         ),
         if (waiting.isEmpty) const ListTile(title: Text('Alle Athleten gestartet')),
-        for (final athlete in waiting) _StartRow(athlete: athlete, autoStartEnabled: _autoStartEnabled, onStart: () => _manualStart(athlete)),
+        for (final athlete in waiting)
+          _StartRow(
+            athlete: athlete,
+            autoStartEnabled: _autoStartEnabled,
+            currentCompetitionTime: _competitionClock.nowDateTime(),
+            onStart: () => _manualStart(athlete),
+          ),
       ])),
       _Section(title: 'Unterwegs', subtitle: 'letzter bekannter Stand', child: Column(children: [
         if (running.isEmpty) const ListTile(title: Text('Noch niemand unterwegs')),
-        for (final athlete in running) ListTile(leading: _Bib(bib: athlete.bib), title: Text(athlete.name.toUpperCase()), subtitle: Text('${athlete.category} · ${_lastStand(athlete)}'), trailing: PopupMenuButton<String>(onSelected: (value) { if (value == 'dnf') _markDnf(athlete); }, itemBuilder: (_) => const [PopupMenuItem(value: 'dnf', child: Text('Als DNF markieren'))])),
+        for (final athlete in running) ListTile(leading: _Bib(bib: athlete.bib), title: Text(athlete.name.toUpperCase()), subtitle: Text('${athlete.category} · ${_lastStand(athlete)}'), trailing: TextButton.icon(onPressed: () => _markDnf(athlete), icon: const Icon(Icons.person_off_outlined), label: const Text('DNF'))),
       ])),
       _Section(title: 'Zuletzt im Ziel', subtitle: 'Laufzeit · Platz · Rückstand', child: Column(children: [
         if (finished.isEmpty) const ListTile(title: Text('Noch keine Zielzeit')),
         for (final athlete in finished) ListTile(leading: _Bib(bib: athlete.bib), title: Text(athlete.name.toUpperCase()), subtitle: Text(athlete.category), trailing: Text(_finishSummary(athlete))),
       ])),
+      Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 12),
+        child: OutlinedButton.icon(
+          onPressed: _abortRunningCompetition,
+          icon: const Icon(Icons.cancel_outlined),
+          label: const Text('Lauf abbrechen und Setup öffnen'),
+        ),
+      ),
     ]);
   }
 
   Widget _capturePage() {
     final event = _event;
     if (event == null) return const Center(child: Text('Kein Bewerb geladen'));
+    if (_multiuserConnection?.role == MultiuserRole.helper &&
+        _multiuserConnection?.isAssigned != true) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.hourglass_top, size: 48),
+              SizedBox(height: 16),
+              Text('Verbunden', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600)),
+              SizedBox(height: 8),
+              Text('Warte auf die Zuweisung durch den Administrator.', textAlign: TextAlign.center),
+            ],
+          ),
+        ),
+      );
+    }
+    final assignedCheckpointId =
+        _multiuserConnection?.role == MultiuserRole.helper
+            ? _multiuserConnection?.checkpointId
+            : null;
+    final visiblePoints = assignedCheckpointId == null
+        ? event.points
+        : event.points.where((point) => point.id == assignedCheckpointId).toList();
+    final openPoints = <(SplitPoint, List<Candidate>)>[];
+    for (final point in visiblePoints) {
+      final candidates = _candidatesFor(point);
+      if (candidates.isNotEmpty) openPoints.add((point, candidates));
+    }
     return ListView(padding: const EdgeInsets.all(12), children: [
       Padding(
         padding: const EdgeInsets.only(bottom: 8),
-        child: Wrap(spacing: 8, runSpacing: 8, children: [
-          OutlinedButton.icon(onPressed: _addSplitPointFromCapture, icon: const Icon(Icons.add_location_alt), label: const Text('Messpunkt hinzufügen')),
-          OutlinedButton.icon(onPressed: _changePenaltyDuringRace, icon: const Icon(Icons.timer_outlined), label: const Text('Strafzeit')),
-        ]),
+        child: _multiuserConnection?.role == MultiuserRole.helper
+            ? ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.pin_drop_outlined),
+                title: Text(_multiuserConnection?.checkpointName ?? 'Messpunkt'),
+                subtitle: const Text('Helfermodus: Nur dieser Messpunkt ist freigeschaltet.'),
+              )
+            : Wrap(spacing: 8, runSpacing: 8, children: [
+                OutlinedButton.icon(onPressed: _addSplitPointFromCapture, icon: const Icon(Icons.add_location_alt), label: const Text('Messpunkt hinzufügen')),
+                OutlinedButton.icon(onPressed: _changePenaltyDuringRace, icon: const Icon(Icons.timer_outlined), label: const Text('Strafzeit')),
+                OutlinedButton.icon(onPressed: _chooseDnfAthlete, icon: const Icon(Icons.person_off_outlined), label: const Text('DNF')),
+              ]),
       ),
-      for (final point in event.points)
-        _Section(title: point.name, subtitle: point.trainerNote?.isNotEmpty == true ? point.trainerNote! : point.type == PointType.finish ? 'Ziel · offizielle Zeit inklusive aktiver Zeitstrafen' : point.type == PointType.shootingExit ? 'Schießstand aus · L/S und 0–5 Fehler erfassen' : 'Messpunkt · Prognose lernt nach ersten Durchgängen', child: Column(children: [
-          Align(alignment: Alignment.centerRight, child: IconButton(tooltip: 'Bezeichnung und Hinweis bearbeiten', onPressed: () => _editPointDuringRace(point), icon: const Icon(Icons.edit_note))),
-          if (_candidatesFor(point).isEmpty) const ListTile(title: Text('Keine Athleten erwartet')),
-          for (final c in _candidatesFor(point)) _CaptureRow(candidate: c, etaText: _eta(c.predictedTime), liveGapText: _liveGapText(c.athlete, point), onTap: () => _capture(c.athlete, point)),
-        ])),
+      if (openPoints.isEmpty)
+        const _Section(
+          title: 'Keine offenen Erfassungen',
+          subtitle: 'Alle laufenden Athleten wurden an den verfügbaren Messpunkten erfasst.',
+          child: SizedBox.shrink(),
+        ),
+      for (final entry in openPoints)
+        _Section(
+          title: entry.$1.name,
+          subtitle: entry.$1.trainerNote?.isNotEmpty == true
+              ? entry.$1.trainerNote!
+              : entry.$1.type == PointType.finish
+                  ? 'Ziel · offizielle Zeit inklusive aktiver Zeitstrafen'
+                  : entry.$1.type == PointType.shootingExit
+                      ? 'Anschlag: ${_shootingPositionLabel(entry.$1.shootingPosition)} · 0–5 Schießfehler erfassen'
+                      : 'Messpunkt · Prognose zeigt die erwartete Ankunft aus der Laufleistung',
+          child: Column(children: [
+            if (_multiuserConnection?.role != MultiuserRole.helper)
+              Align(alignment: Alignment.centerRight, child: IconButton(tooltip: 'Bezeichnung und Hinweis bearbeiten', onPressed: () => _editPointDuringRace(entry.$1), icon: const Icon(Icons.edit_note))),
+            for (final c in entry.$2)
+              _CaptureRow(candidate: c, etaText: _eta(c.predictedTime), liveGapText: _liveGapText(c.athlete, entry.$1), onTap: () => _capture(c.athlete, entry.$1)),
+          ]),
+        ),
     ]);
   }
 
@@ -2214,7 +3409,21 @@ class _CoachSplitHomeState extends State<CoachSplitHome> {
       const SizedBox(height: 8),
       Expanded(child: DefaultTabController(length: event.points.length, child: Column(children: [
         TabBar(isScrollable: true, tabs: [for (final p in event.points) Tab(text: p.name)]),
-        Expanded(child: TabBarView(children: [for (final p in event.points) _Results(point: p, rows: _ranking(p), compareByCategory: event.compareByCategory, fmt: _fmtDuration)])),
+        Expanded(
+          child: TabBarView(
+            children: [
+              for (final p in event.points)
+                _Results(
+                  point: p,
+                  rows: _ranking(p),
+                  compareByCategory: event.compareByCategory,
+                  fmt: _fmtDuration,
+                  shootingResultFor: (athlete) =>
+                      athlete.shootingResults[_key(p)],
+                ),
+            ],
+          ),
+        ),
       ]))),
     ]);
   }

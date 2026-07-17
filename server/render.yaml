@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: coachsplit-sync
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: COACHSPLIT_DATA_FILE
+        value: /var/data/coachsplit-sync-data.json
+    disk:
+      name: coachsplit-data
+      mountPath: /var/data
+      sizeGB: 1
